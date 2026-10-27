@@ -1,0 +1,56 @@
+.comparison {min-width:0}
+.compare-count {font-size:11px;font-weight:400;color:#8b95a3;margin-left:10px}
+.compare-actions {display:flex;gap:8px;flex-wrap:wrap}
+.compare-controls {display:flex;align-items:center;gap:12px;padding:4px 24px 16px;flex-wrap:wrap}
+.compare-search {display:flex;align-items:center;gap:9px;border:1px solid #dde4eb;background:#fafbfd;border-radius:7px;padding:10px 12px;flex:1;min-width:220px;color:#7f8c9b}
+.compare-search input {border:0;background:transparent;outline:0;width:100%;font-size:12px;color:#293446}
+.compare-search:focus-within {outline:2px solid #4b86b7;outline-offset:2px}
+.compare-options {margin:0 24px 14px;border:1px solid #e2e8ee;border-radius:9px;background:#fafbfd}
+.compare-options-head {display:flex;align-items:center;justify-content:space-between;padding:8px 12px;font-size:11px;color:#7a8796;gap:12px}
+.compare-option-grid {display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:7px;padding:0 10px 10px;max-height:240px;overflow-y:auto}
+.compare-option {display:flex;justify-content:space-between;align-items:center;gap:8px;padding:10px 12px;border:1px solid #e2e8ee;border-radius:7px;background:#fff;text-align:left;min-width:0}
+.compare-option.selected {background:#eaf0f6;border-color:#a9bdce;color:#365a80}
+.compare-option>span {min-width:0}
+.compare-option strong {display:block;font-size:12px;font-weight:500;white-space:nowrap;text-overflow:ellipsis;overflow:hidden}
+.compare-option small {display:block;font-size:10px;color:#8291a0;margin-top:5px}
+.compare-option svg {flex-shrink:0}
+.compare-chips {display:flex;flex-wrap:wrap;align-items:center;gap:9px;padding:0 24px 22px;font-size:12px;min-height:44px}
+.compare-chip {display:flex;align-items:center;gap:8px;background:#f2f5f8;border:1px solid #e3e9ee;border-radius:6px;padding:7px 8px 7px 10px}
+.compare-chip i,.compare-table-name i {width:8px;height:8px;border-radius:50%;display:inline-block;flex-shrink:0}
+.compare-chip small {font-size:10px;color:#8b96a2}
+.compare-chip button {display:grid;place-items:center;padding:2px;color:#7c8a98}
+.compare-chart-toolbar {display:flex;align-items:center;justify-content:space-between;gap:12px;padding:0 24px 12px;color:#778493;font-size:11px;flex-wrap:wrap}
+.compare-view-toolbar {display:flex;align-items:center;gap:14px;flex-wrap:wrap;padding:0 24px 18px;color:#84909e;font-size:11px}
+.comparison .button {font-size:11px}
+.compare-message {display:flex;align-items:center;gap:8px;margin:0;padding:8px 24px 14px;font-size:12px;color:#7c8998;line-height:1.7}
+.compare-footnote {padding:4px 24px 23px;color:#83909e;font-size:11px;line-height:1.9}
+.compare-footnote details {margin-top:12px}
+.compare-footnote summary {color:#365a80;cursor:pointer;width:max-content}
+.compare-footnote details p {margin-top:8px}
+.compare-footnote a {text-decoration:underline}
+.compare-table-name {display:flex;gap:9px;align-items:center;margin-bottom:6px}
+.compare-source {min-width:220px}
+.compare-source a {color:#365a80}
+.compare-source small {display:block;font-size:10px;color:#8793a1;margin-top:6px}
+.compare-source details {font-size:11px;max-width:300px;margin-top:6px}
+.compare-source details p {overflow-wrap:anywhere;white-space:normal}
+.compare-matrix td,.compare-matrix th {text-align:center;min-width:115px}
+.compare-matrix th:first-child {text-align:left}
+.compare-matrix td strong {font-size:16px;font-weight:500;display:block;color:#365a80}
+.compare-matrix td small {display:block;font-size:10px;color:#85909e;margin-top:5px}
+.comparison .notice {margin:0 24px 12px}
+@media(max-width:1100px) {.compare-option-grid {grid-template-columns:repeat(2,minmax(0,1fr))}}
+@media(max-width:600px) {
+  .compare-controls {padding:2px 17px 15px;gap:10px}
+  .compare-search {min-width:0;flex-basis:100%;order:2}
+  .compare-controls>.button {margin-left:auto}
+  .compare-options {margin:0 17px 14px}
+  .compare-option-grid {grid-template-columns:1fr}
+  .compare-chips {padding:0 17px 20px}
+  .compare-chip {gap:6px;font-size:11px}
+  .compare-chip small {display:none}
+  .compare-chart-toolbar,.compare-footnote {padding-left:17px;padding-right:17px}
+  .compare-view-toolbar {padding-left:17px;padding-right:17px;gap:9px}
+  .compare-message {padding-left:17px;padding-right:17px;font-size:11px}
+  .comparison .notice {margin-left:17px;margin-right:17px}
+}

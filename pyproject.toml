@@ -1,0 +1,28 @@
+[build-system]
+requires = ["setuptools>=75"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ashare-observer"
+version = "0.1.0"
+description = "Private A-share research, premarket reports and local paper trading"
+requires-python = ">=3.12,<3.15"
+dependencies = [
+  "fastapi>=0.115,<1", "uvicorn>=0.34,<1", "pandas>=2.2,<3",
+  "numpy>=2,<3", "pyarrow>=19,<24", "duckdb>=1.2,<2",
+  "akshare>=1.18,<2", "httpx>=0.28,<1", "pydantic>=2.10,<3",
+  "lightgbm>=4.6,<5", "scikit-learn>=1.5,<2"
+]
+
+[project.optional-dependencies]
+test = ["pytest>=8,<10"]
+
+[project.scripts]
+ashare = "ashare.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["backend"]
+
+[tool.pytest.ini_options]
+pythonpath = ["backend"]
+testpaths = ["tests"]
