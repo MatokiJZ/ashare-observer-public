@@ -17,8 +17,34 @@ from .core import atomic_json, config, data_dir, digest, dt, iso, now, read_json
 from .storage import save_snapshot, snapshot
 
 
+def in_actions() -> bool:
+    return os.getenv("GITHUB_ACTIONS", "").lower() == "true"
+
+
+def storage_repository(repository: str | None = None) -> str:
+    """Keep the public compute repository out of the private data path."""
+    storage = os.getenv("ASHARE_STORAGE_REPO", "").strip()
+    compute = os.getenv("GITHUB_REPOSITORY", "").strip()
+    if in_actions():
+        if not storage or not compute or storage.casefold() == compute.casefold():
+            raise ValueError("云端必须显式配置与计算仓库不同的私有数据仓库")
+    if storage and repository and repository.casefold() != storage.casefold():
+        raise ValueError("拒绝访问配置以外的数据仓库")
+    result = storage or repository or config()["github_repo"]
+    if not re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", result):
+        raise ValueError("尚未配置 GitHub 私有仓库")
+    return result
+
+
 def token() -> str:
-    value = os.getenv("ASHARE_GITHUB_TOKEN") or os.getenv("GITHUB_TOKEN")
+    # A public job's repository token cannot authorize the private data store.
+    # Never read a local credential file or invoke gh inside Actions.
+    value = os.getenv("ASHARE_STORAGE_TOKEN", "").strip()
+    if in_actions():
+        if not value:
+            raise ValueError("缺少仅授权私有数据仓库的 ASHARE_STORAGE_TOKEN")
+        return value
+    value = value or os.getenv("ASHARE_GITHUB_TOKEN") or os.getenv("GITHUB_TOKEN")
     private_file = Path.home() / ".config/ashare-observer/github-token"
     if not value and private_file.exists():
         value = private_file.read_text().strip()
@@ -33,13 +59,38 @@ def token() -> str:
 
 class GitHub:
     def __init__(self, repository: str | None = None):
-        self.repo = repository or config()["github_repo"]
-        if not re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", self.repo):
-            raise ValueError("尚未配置 GitHub 私有仓库")
+        self.repo = storage_repository(repository)
         self.client = httpx.Client(base_url="https://api.github.com", headers={"Authorization": f"Bearer {token()}", "Accept": "application/vnd.github+json", "X-GitHub-Api-Version": "2022-11-28"}, timeout=30, follow_redirects=False)
+        try:
+            self.require_private()
+        except Exception:
+            self.client.close()
+            raise
+
+    def require_private(self):
+        """Fail closed on missing, inaccessible, public or mismatched metadata."""
+        try:
+            response = self.client.get(f"/repos/{self.repo}")
+            response.raise_for_status()
+            metadata = response.json()
+            valid = (metadata.get("private") is True
+                     and isinstance(metadata.get("full_name"), str)
+                     and metadata["full_name"].casefold() == self.repo.casefold())
+        except Exception:
+            raise ValueError("无法核实数据仓库为预期的私有仓库") from None
+        if not valid:
+            raise ValueError("数据仓库不是预期的私有仓库")
 
     def api(self, path: str, method="GET", body=None):
-        response = self.client.request(method, f"/repos/{self.repo}/{path}", json=body)
+        method = method.upper()
+        if method != "GET":
+            # Recheck before every mutation in case visibility changed mid-run.
+            self.require_private()
+        if path == "git/commits" and method == "POST":
+            identity = {"name": "github-actions[bot]", "email": "41898282+github-actions[bot]@users.noreply.github.com"}
+            body = {**body, "author": dict(identity), "committer": dict(identity)}
+        endpoint = f"/repos/{self.repo}" + (f"/{path}" if path else "")
+        response = self.client.request(method, endpoint, json=body)
         response.raise_for_status()
         return response.json() if response.content else {}
 
@@ -186,7 +237,7 @@ def publish_research_assets():
         target = data_dir()/"cloud_reviews"/(review["trade_date"]+"-"+review["revision"]+".json")
         if not target.exists():
             atomic_json(target,review)
-    gh = GitHub(os.environ.get("GITHUB_REPOSITORY"))
+    gh = GitHub()
     assets = {str(p.relative_to(data_dir())):p for folder in ("models","training_runs","cloud_reviews")
               for p in (data_dir()/folder).rglob("*") if p.is_file() and research_asset(str(p.relative_to(data_dir())))}
     for attempt in range(3):
@@ -294,7 +345,7 @@ def bootstrap_checkpoint(gh: GitHub):
 
 def publish_report(report: dict):
     """Optimistic Git ref update; retry on races, never force-push or overwrite versions."""
-    gh = GitHub(os.environ.get("GITHUB_REPOSITORY"))
+    gh = GitHub()
     raw = json.dumps(report, ensure_ascii=False, indent=2, allow_nan=False).encode()
     path = f"reports/{report['id']}.json"
     manifest = json.dumps({"sha256": digest(raw), "bytes": len(raw), "generated_at": report["generated_at"]}).encode()
