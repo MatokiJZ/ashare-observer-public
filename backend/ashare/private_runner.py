@@ -6,6 +6,7 @@ or activates a model. Tests replace external providers and storage transports.
 from __future__ import annotations
 
 import os
+import re
 from pathlib import Path
 
 from . import cloud, jobs, learning, reviews, storage
@@ -75,6 +76,7 @@ def execute(mode, at=None):
     receipt = empty_receipt(mode)
     phase = "input"
     try:
+        branch = cloud.write_branch()
         if mode not in MODES:
             raise ValueError("Unknown mode")
         day = at.date().isoformat()
@@ -92,6 +94,9 @@ def execute(mode, at=None):
         restored = synced.get("checkpoint", {})
         if synced.get("state") != "success" or restored.get("state") != "success" or restored.get("day_files", 0) <= 0:
             raise ValueError("Private input restore incomplete")
+        revision = synced.get("data_revision", {})
+        if revision.get("branch") != "data" or not re.fullmatch(r"[a-f0-9]{40}", revision.get("commit", "")):
+            raise ValueError("Production input revision unavailable")
         calendar_payload = jobs.collect("calendar", timeout=40)
         if calendar_payload.get("error"):
             raise ValueError("Calendar update failed")
@@ -112,15 +117,29 @@ def execute(mode, at=None):
         before_control = storage.snapshot("model_control")
         source_keys = ("source", "release_id", "asset_id", "artifact_id", "tag", "sha256", "bytes",
                        "day_files", "first_date", "last_date", "degraded", "failed_release_ids", "readback_verified")
-        evidence = {"input": {"restore": {k: restored[k] for k in source_keys if k in restored},
+        evidence = {"input": {"data_revision": revision,
+                              "restore": {k: restored[k] for k in source_keys if k in restored},
                               "inspection": input_evidence},
                     "expected_date": expected, "started_at": iso(at),
-                    "code_revision": os.getenv("GITHUB_SHA", "synthetic-local")}
+                    "code_revision": os.getenv("GITHUB_SHA", "synthetic-local"),
+                    "input_branch": "data", "write_branch": branch}
         if mode == "train":
-            result = learning.train(at=at)
+            force_fresh = branch == "migration-acceptance"
+            existing_models = {path.name for path in (data_dir() / "models").iterdir()} if (data_dir() / "models").exists() else set()
+            current_prefix = at.strftime("%Y-%m-%d-%H%M%S") + "-"
+            if force_fresh and (any(identifier.startswith(current_prefix) for identifier in existing_models)
+                    or (data_dir() / "training_runs" / (at.strftime("%Y-%m-%d-%H%M%S") + ".json")).exists()):
+                raise ValueError("Fresh acceptance training timestamp already exists")
+            # Only the isolated acceptance namespace bypasses the weekly reuse
+            # shortcut. The fixed training recipe and model controls are unchanged.
+            result = learning.train(at=at, force=force_fresh)
             model_id, reused_training = verify_model(result, at)
+            if force_fresh and (reused_training or dt(result["started_at"]) != at
+                    or model_id in existing_models or not model_id.startswith(current_prefix)):
+                raise ValueError("Acceptance requires a newly trained model at this run timestamp")
             evidence["model_id"] = model_id
             evidence["research_reused"] = reused_training
+            evidence["research_forced_fresh"] = force_fresh
         else:
             result = jobs.build_report(mode, budget_seconds=480)
             verify_report(result, mode, at, expected)

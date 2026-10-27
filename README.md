@@ -1,7 +1,7 @@
 > 本仓库公开一份独立的代码基线，不含原仓库 Git 历史、数据分支、模型文件、行情检查点、历史运行记录或发布包，也不包含本地尚未提交的开发改动。
-> 公开 CI 仅在 push、pull request 或手动触发时运行隔离测试及前端构建；没有定时任务、行情采集、研究训练任务、私有缓存或产物上传。测试使用临时数据和模拟接口；模型流程测试只使用合成样本，不产生可用的研究模型。
+> 代码 CI 在 push、pull request 或手动触发时运行隔离测试及前端构建。另有默认仅合成验证的手动研究验收入口；真实输入需要专用 App、固定代码版本和用户环境审批，尚未验收完成。没有定时任务、私有缓存或公开产物上传。测试只使用临时合成数据及模拟接口。
 > 原私有仓库的采集、训练和运行数据尚未迁移。这里不提供已部署的日报服务，也不代表原私有任务已停止或其 Actions 分钟消耗已消除。
-> 已实现私有 Release 检查点上传/下载与回读校验、私有数据写后回读和隔离日志封装，并提供手动合成迁移验证。真实工作流仅为不可执行的文档模板；没有配置 App、凭据或 Environment，旧云端入口仍在 Actions 中拒绝执行。[迁移实现与验收缺口](docs/cloud-migration.md)说明后续操作确认及真实端到端验证要求。
+> 已实现私有 Release 检查点上传/下载与回读校验、私有数据写后回读和隔离日志封装，并提供手动合成迁移验证。真实入口限定隔离验收分支，不覆盖生产数据。Environment 已限制 main、人工审批及禁管理员绕过；App/私钥配置和真实验收仍待完成，旧云端入口仍在 Actions 中拒绝执行。[迁移实现与验收缺口](docs/cloud-migration.md)说明后续操作确认及真实端到端验证要求。
 
 # A 股观察
 
@@ -137,7 +137,7 @@ macOS 登录后自动启动：
 
 - `backend/ashare`：数据适配、交易日历、策略、报告、同步、模拟账户及 FastAPI。
 - `frontend`：React / TypeScript / ECharts 六页工作台。
-- `.github/workflows`：仅代码测试与前端构建；原采集、研究和训练工作流未包含。
+- `.github/workflows`：代码测试、合成迁移验证及受保护的手动研究验收；原定时任务尚未迁移。
 - `data/bars`：Parquet 行情，DuckDB 读取；`data/state.sqlite`：本地模拟账户与提醒。
 
 只读接口：`/api/overview`、`/api/sectors`、`/api/linkages`、`/api/candidates`、`/api/stocks/{code}`、`/api/events`、`/api/portfolio`、`/api/health`、`/api/reports`、`/api/research-snapshot`。

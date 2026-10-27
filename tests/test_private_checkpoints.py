@@ -46,8 +46,8 @@ class Store:
         path = request.url.path.removeprefix(f"/repos/{self.repo}/")
         if request.method != "GET":
             self.mutations.append((request.method, path))
-        if path == "git/ref/heads/data":
-            return httpx.Response(200, json={"object": {"sha": "a" * 40}})
+        if path in {"git/ref/heads/data", "git/ref/heads/migration-acceptance"}:
+            return httpx.Response(200, json={"object": {"sha": ("a" if path.endswith("/data") else "b") * 40}})
         if path.startswith("releases/tags/"):
             tag = path.removeprefix("releases/tags/")
             value = next((r for r in self.releases.values() if r["tag_name"] == tag and r.get("draft") is False), None)
@@ -58,7 +58,8 @@ class Store:
             return httpx.Response(200, json=values[(page - 1) * 100:page * 100])
         if path == "releases" and request.method == "POST":
             body = json.loads(request.content)
-            assert body["target_commitish"] == "a" * 40
+            expected = "b" if body["tag_name"].startswith(pc.ACCEPTANCE_TAG_PREFIX) else "a"
+            assert body["target_commitish"] == expected * 40
             identifier = len(self.releases) + 1
             value = {"id": identifier, **body}
             self.releases[identifier] = value
@@ -91,6 +92,12 @@ class Store:
                 raise httpx.ReadTimeout("synthetic timeout", request=request)
             return httpx.Response(200, json=self.releases[identifier])
         pytest.fail(f"Unexpected synthetic request {request.method} {path}")
+
+
+@pytest.fixture(autouse=True)
+def write_environment(monkeypatch):
+    monkeypatch.setenv("GITHUB_ACTIONS", "false")
+    monkeypatch.delenv("ASHARE_WRITE_BRANCH", raising=False)
 
 
 @pytest.fixture
@@ -142,6 +149,49 @@ def test_restore_verifies_then_imports(checkpoint):
     assert result["source"] == "private_release"
     assert result["degraded"] is False
     assert len(pd.read_parquet(data_dir() / "bars/day/600000.parquet")) == 2
+
+
+def test_acceptance_checkpoint_targets_isolated_head_and_is_not_production_input(checkpoint, monkeypatch):
+    gh = Store()
+    monkeypatch.setenv("GITHUB_ACTIONS", "true")
+    monkeypatch.setenv("ASHARE_WRITE_BRANCH", "migration-acceptance")
+    result = pc.publish_checkpoint(gh, checkpoint, "2026-10-20")
+    assert result["readback_verified"] and result["branch"] == "migration-acceptance"
+    assert result["tag"].startswith(pc.ACCEPTANCE_TAG_PREFIX)
+    assert gh.releases[1]["target_commitish"] == "b" * 40
+    mutations = list(gh.mutations)
+    repeated = pc.publish_checkpoint(gh, checkpoint, "2026-10-20")
+    assert repeated["reused"] and repeated["release_id"] == result["release_id"]
+    assert mutations == gh.mutations
+    with pytest.raises(pc.CheckpointNotFound):
+        pc.restore_checkpoint(gh, "2026-10-20")
+
+
+def test_same_bytes_acceptance_release_cannot_replace_production_restore(checkpoint, monkeypatch):
+    gh = Store()
+    production = pc.publish_checkpoint(gh, checkpoint, "2026-10-20")
+    production_release = dict(gh.releases[production["release_id"]])
+    before = len(gh.mutations)
+    monkeypatch.setenv("GITHUB_ACTIONS", "true")
+    monkeypatch.setenv("ASHARE_WRITE_BRANCH", "migration-acceptance")
+    isolated = pc.publish_checkpoint(gh, checkpoint, "2026-10-20")
+    assert production["sha256"] == isolated["sha256"]
+    assert production["tag"] != isolated["tag"] and isolated["release_id"] != production["release_id"]
+    assert gh.releases[production["release_id"]] == production_release
+    assert not any(path.startswith("releases/1") for _, path in gh.mutations[before:])
+    restored = pc.restore_checkpoint(gh, "2026-10-20")
+    assert restored["release_id"] == production["release_id"] and restored["tag"] == production["tag"]
+
+
+@pytest.mark.parametrize("branch", [None, "data", "main"])
+def test_actions_checkpoint_without_isolated_namespace_never_contacts_storage(checkpoint, monkeypatch, branch):
+    gh = Store()
+    monkeypatch.setenv("GITHUB_ACTIONS", "true")
+    if branch:
+        monkeypatch.setenv("ASHARE_WRITE_BRANCH", branch)
+    with pytest.raises(ValueError, match="migration-acceptance"):
+        pc.publish_checkpoint(gh, checkpoint, "2026-10-20")
+    assert not gh.calls and not gh.mutations
 
 
 def test_empty_release_listing_is_distinct_from_corruption(checkpoint):

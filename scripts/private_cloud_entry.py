@@ -19,6 +19,8 @@ import tempfile
 
 COMPUTE_REPOSITORY = "MatokiJZ/ashare-observer-public"
 STORAGE_REPOSITORY = "MatokiJZ/ashare-observer"
+TRUSTED_ACTOR = "MatokiJZ"
+WRITE_BRANCH = "migration-acceptance"
 MODES = {"initial", "update", "fallback", "close", "train"}
 STAGES = ("input", "research", "publish", "readback")
 COUNTS = ("reports", "models", "checkpoints")
@@ -46,7 +48,10 @@ def validate_environment(env):
         "GITHUB_REPOSITORY": COMPUTE_REPOSITORY,
         "GITHUB_REF": "refs/heads/main",
         "GITHUB_EVENT_NAME": "workflow_dispatch",
+        "GITHUB_ACTOR": TRUSTED_ACTOR,
+        "GITHUB_TRIGGERING_ACTOR": TRUSTED_ACTOR,
         "ASHARE_STORAGE_REPO": STORAGE_REPOSITORY,
+        "ASHARE_WRITE_BRANCH": WRITE_BRANCH,
         "ASHARE_PRIVATE_RUN_APPROVED": "1",
         "ASHARE_PROTECTED_ENVIRONMENT": "private-storage",
     }
@@ -54,6 +59,7 @@ def validate_environment(env):
         return False
     return (env.get("TASK_MODE") in MODES
             and re.fullmatch(r"[a-f0-9]{40}", env.get("GITHUB_SHA", "")) is not None
+            and env.get("ASHARE_ACCEPTANCE_COMMIT") == env.get("GITHUB_SHA")
             and bool(env.get("ASHARE_STORAGE_TOKEN", "").strip()))
 
 
@@ -143,10 +149,12 @@ def worker_environment(env, temporary, receipt):
         "ASHARE_COMPUTE_REPO": COMPUTE_REPOSITORY,
         "ASHARE_COMPUTE_WORKFLOW": "private-research.yml",
         "ASHARE_GITHUB_REPO": STORAGE_REPOSITORY,
+        "ASHARE_WRITE_BRANCH": WRITE_BRANCH,
         "OMP_NUM_THREADS": "2",
         "OPENBLAS_NUM_THREADS": "2",
     }
     for key in ("GITHUB_ACTIONS", "GITHUB_REPOSITORY", "GITHUB_REF", "GITHUB_EVENT_NAME", "GITHUB_SHA",
+                "GITHUB_ACTOR", "GITHUB_TRIGGERING_ACTOR", "ASHARE_ACCEPTANCE_COMMIT",
                 "ASHARE_STORAGE_REPO", "ASHARE_STORAGE_TOKEN", "ASHARE_PRIVATE_RUN_APPROVED",
                 "ASHARE_PROTECTED_ENVIRONMENT", "TASK_MODE"):
         result[key] = env[key]

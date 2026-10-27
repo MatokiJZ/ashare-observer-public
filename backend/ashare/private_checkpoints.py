@@ -36,6 +36,7 @@ MAX_PARQUET_ROWS = 30000
 MAX_PARQUET_COLUMNS = 64
 MAX_RELEASE_PAGES = 10
 TAG_PREFIX = "ashare-checkpoint-v1-"
+ACCEPTANCE_TAG_PREFIX = "ashare-acceptance-checkpoint-v1-"
 ASSET_NAMES = {"checkpoint.tar.gz", "manifest.json"}
 
 
@@ -278,7 +279,7 @@ def _scope(gh):
 def _identity(release, tag=None):
     if (not isinstance(release, dict) or type(release.get("id")) is not int or release["id"] <= 0
             or type(release.get("draft")) is not bool
-            or not re.fullmatch(TAG_PREFIX + r"[a-f0-9]{64}", release.get("tag_name", ""))
+            or not re.fullmatch(r"(?:" + TAG_PREFIX + "|" + ACCEPTANCE_TAG_PREFIX + r")[a-f0-9]{64}", release.get("tag_name", ""))
             or (tag and release["tag_name"] != tag)):
         raise CheckpointValidationError("Checkpoint release identity invalid")
     return release
@@ -397,7 +398,7 @@ def _upload(gh, release, name, raw):
             raise CheckpointValidationError("Immutable checkpoint asset conflict")
 
 
-def _verify(gh, release, expected_date=None):
+def _verify(gh, release, expected_date=None, prefix=TAG_PREFIX):
     release = _identity(release)
     assets = _assets(gh, release)
     if set(assets) != ASSET_NAMES:
@@ -405,20 +406,23 @@ def _verify(gh, release, expected_date=None):
     raw = _download(gh, assets["checkpoint.tar.gz"], MAX_ARCHIVE)
     manifest = _json(_download(gh, assets["manifest.json"], MAX_MANIFEST))
     stats = _inspect(raw, expected_date)
-    if manifest != stats or release["tag_name"] != TAG_PREFIX + stats["sha256"]:
+    if prefix not in {TAG_PREFIX, ACCEPTANCE_TAG_PREFIX} or manifest != stats or release["tag_name"] != prefix + stats["sha256"]:
         raise CheckpointValidationError("Checkpoint outer manifest mismatch")
     return raw, stats
 
 
 def publish_checkpoint(gh, path: Path, expected_date: str) -> dict:
+    from .cloud import write_branch
+    branch = write_branch()
+    prefix = ACCEPTANCE_TAG_PREFIX if branch == "migration-acceptance" else TAG_PREFIX
     _scope(gh)
     stats = inspect_checkpoint(path, expected_date)
     raw = Path(path).read_bytes()
-    tag = TAG_PREFIX + stats["sha256"]
+    tag = prefix + stats["sha256"]
     release = _find(gh, tag)
     reused = release is not None
     if release is None:
-        parent = gh.api("git/ref/heads/data").get("object", {}).get("sha", "")
+        parent = gh.api(f"git/ref/heads/{branch}").get("object", {}).get("sha", "")
         if not re.fullmatch(r"[a-f0-9]{40}", parent):
             raise CheckpointValidationError("Private data revision unavailable")
         body = {"tag_name": tag, "target_commitish": parent, "name": "Private research checkpoint",
@@ -431,14 +435,14 @@ def publish_checkpoint(gh, path: Path, expected_date: str) -> dict:
             if release is None:
                 raise CheckpointUncertain("Checkpoint release creation outcome unresolved") from None
     if not release.get("draft"):
-        _, verified = _verify(gh, release, expected_date)
-        return _receipt(release, verified, reused=True)
+        _, verified = _verify(gh, release, expected_date, prefix=prefix)
+        return _receipt(release, verified, reused=True, branch=branch)
     _upload(gh, release, "checkpoint.tar.gz", raw)
     manifest = json.dumps(stats, sort_keys=True, separators=(",", ":")).encode()
     if len(manifest) > MAX_MANIFEST:
         raise CheckpointValidationError("Checkpoint manifest too large")
     _upload(gh, release, "manifest.json", manifest)
-    _, verified = _verify(gh, release, expected_date)
+    _, verified = _verify(gh, release, expected_date, prefix=prefix)
     try:
         _write(gh, f"releases/{release['id']}", "PATCH", {"draft": False, "make_latest": "false"})
     except (httpx.TransportError, httpx.HTTPStatusError):
@@ -448,8 +452,8 @@ def publish_checkpoint(gh, path: Path, expected_date: str) -> dict:
     current = _find(gh, tag)
     if current is None or current.get("draft") is not False:
         raise CheckpointUncertain("Checkpoint publication not observed")
-    _, verified = _verify(gh, current, expected_date)
-    return _receipt(current, verified, reused=reused)
+    _, verified = _verify(gh, current, expected_date, prefix=prefix)
+    return _receipt(current, verified, reused=reused, branch=branch)
 
 
 def _receipt(release, stats, **extra):

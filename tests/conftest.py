@@ -9,6 +9,8 @@ def isolated_data(tmp_path, monkeypatch):
     monkeypatch.setenv("ASHARE_DATA_DIR", str(tmp_path / "data"))
     monkeypatch.setenv("ASHARE_MONITOR", "0")
     monkeypatch.setenv("ASHARE_GITHUB_REPO", "")
+    monkeypatch.setenv("GITHUB_ACTIONS", "false")
+    monkeypatch.delenv("ASHARE_WRITE_BRANCH", raising=False)
     monkeypatch.delenv("ASHARE_GITHUB_TOKEN", raising=False)
     monkeypatch.delenv("GITHUB_TOKEN", raising=False)
     monkeypatch.delenv("ASHARE_STORAGE_TOKEN", raising=False)

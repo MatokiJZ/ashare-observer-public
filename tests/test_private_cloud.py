@@ -21,12 +21,14 @@ def isolated_storage_environment(monkeypatch):
     monkeypatch.delenv("ASHARE_STORAGE_REPO", raising=False)
     monkeypatch.delenv("ASHARE_STORAGE_TOKEN", raising=False)
     monkeypatch.delenv("GITHUB_REPOSITORY", raising=False)
+    monkeypatch.delenv("ASHARE_WRITE_BRANCH", raising=False)
 
 
 def actions(monkeypatch):
     monkeypatch.setenv("GITHUB_ACTIONS", "true")
     monkeypatch.setenv("GITHUB_REPOSITORY", COMPUTE_REPO)
     monkeypatch.setenv("ASHARE_STORAGE_REPO", PRIVATE_REPO)
+    monkeypatch.setenv("ASHARE_WRITE_BRANCH", "migration-acceptance")
 
 
 def client_transport(monkeypatch, handler):

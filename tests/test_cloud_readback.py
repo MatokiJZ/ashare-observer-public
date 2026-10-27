@@ -26,7 +26,7 @@ class FakeGit:
     repo = "example/private"
 
     def __init__(self):
-        self.head = None
+        self.heads = {}
         self.blobs = {}
         self.trees = {}
         self.commits = {}
@@ -35,16 +35,26 @@ class FakeGit:
         self.lose_ref_response = False
         self.corrupt_readback = False
 
+    @property
+    def head(self):
+        return self.heads.get("data")
+
+    @head.setter
+    def head(self, value):
+        self.heads["data"] = value
+
     def api(self, path, method="GET", body=None):
         self.requests.append((path, method, deepcopy(body)))
-        if path == "git/ref/heads/data":
-            if not self.head:
+        if path.startswith("git/ref/heads/"):
+            head = self.heads.get(path.removeprefix("git/ref/heads/"))
+            if not head:
                 raise missing(path)
-            return {"object": {"sha": self.head}}
+            return {"object": {"sha": head}}
         if path.startswith("git/commits/"):
             return {"tree": {"sha": self.commits[path.split("/")[-1]]}}
         if path.startswith("git/trees/"):
-            tree = self.trees[path.split("/")[-1].split("?")[0]]
+            reference = path.split("/")[-1].split("?")[0]
+            tree = self.trees[self.commits.get(reference, reference)]
             return {"tree": [{"path": p, "sha": sha} for p, sha in tree.items()]}
         if path == "git/blobs":
             raw = base64.b64decode(body["content"])
@@ -61,17 +71,18 @@ class FakeGit:
             sha = "commit-" + str(len(self.commits))
             self.commits[sha] = body["tree"]
             return {"sha": sha}
-        if path in {"git/refs", "git/refs/heads/data"}:
-            self.head = body["sha"]
+        if path == "git/refs" or path.startswith("git/refs/heads/"):
+            branch = body["ref"].removeprefix("refs/heads/") if path == "git/refs" else path.removeprefix("git/refs/heads/")
+            self.heads[branch] = body["sha"]
             if self.lose_ref_response:
                 self.lose_ref_response = False
                 raise httpx.ReadTimeout("synthetic lost response")
-            return {"object": {"sha": self.head}}
+            return {"object": {"sha": self.heads[branch]}}
         raise AssertionError((path, method))
 
     def content(self, path, branch="data"):
         self.reads.append((path, branch))
-        commit = self.head if branch == "data" else branch
+        commit = self.heads.get(branch, branch)
         tree = self.trees[self.commits[commit]]
         if path not in tree:
             raise missing("contents/" + path)
@@ -79,6 +90,12 @@ class FakeGit:
         if self.corrupt_readback and not path.endswith(".manifest"):
             return value + b"corrupted"
         return value
+
+
+@pytest.fixture(autouse=True)
+def write_environment(monkeypatch):
+    monkeypatch.setenv("GITHUB_ACTIONS", "false")
+    monkeypatch.delenv("ASHARE_WRITE_BRANCH", raising=False)
 
 
 @pytest.fixture
@@ -308,3 +325,126 @@ def test_unverified_compute_status_is_nonblocking_and_explicit(git, monkeypatch)
     cloud.update_compute_status(git)
     assert storage.snapshot("cloud_status")["state"] == "unavailable"
     assert not git.requests
+
+
+@pytest.mark.parametrize("value,actions,expected", [
+    (None, False, "data"), ("data", False, "data"),
+    ("migration-acceptance", False, "migration-acceptance"),
+    ("migration-acceptance", True, "migration-acceptance"),
+])
+def test_allowed_write_namespaces(monkeypatch, value, actions, expected):
+    monkeypatch.setenv("GITHUB_ACTIONS", str(actions).lower())
+    if value is not None:
+        monkeypatch.setenv("ASHARE_WRITE_BRANCH", value)
+    assert cloud.write_branch() == expected
+
+
+@pytest.mark.parametrize("value,actions", [(None, True), ("data", True), ("main", True), ("main", False)])
+def test_invalid_write_namespace_fails_before_remote_access(git, monkeypatch, value, actions):
+    monkeypatch.setenv("GITHUB_ACTIONS", str(actions).lower())
+    if value is not None:
+        monkeypatch.setenv("ASHARE_WRITE_BRANCH", value)
+    monkeypatch.setattr(cloud, "GitHub", lambda: pytest.fail("No client or credentials before namespace check"))
+    with pytest.raises(ValueError):
+        cloud.publish_report(report())
+    with pytest.raises(ValueError):
+        cloud.publish_research_assets()
+    with pytest.raises(ValueError):
+        cloud.publish_run_receipt("2026-10-20-update", {})
+    with pytest.raises(ValueError):
+        cloud.get_run_receipt("2026-10-20-update")
+    assert not git.requests
+
+
+def acceptance(monkeypatch):
+    monkeypatch.setenv("GITHUB_ACTIONS", "true")
+    monkeypatch.setenv("ASHARE_WRITE_BRANCH", "migration-acceptance")
+
+
+def test_acceptance_starts_independent_root_and_preserves_production(git, monkeypatch):
+    cloud.publish_report(report())
+    production = git.head
+    production_tree = deepcopy(git.trees[git.commits[production]])
+    before = len(git.requests)
+    acceptance(monkeypatch)
+    result = cloud.publish_report({**report(), "strategy_version": "synthetic-acceptance"})
+    assert result["branch"] == "migration-acceptance" and result["published"] == 1
+    assert git.head == production and git.trees[git.commits[production]] == production_tree
+    writes = [(p, b) for p, m, b in git.requests[before:] if m != "GET"]
+    commit = next(b for p, b in writes if p == "git/commits")
+    assert commit["parents"] == []
+    assert not any(p == "git/refs/heads/data" or b.get("ref") == "refs/heads/data" for p, b in writes)
+    assert git.heads["migration-acceptance"] != production
+
+
+def test_production_receipt_does_not_skip_or_conflict_with_acceptance(git, monkeypatch):
+    key = "2026-10-20-update"
+    value = {"schema_version": 1, "state": "verified", "mode": "update", "day": "2026-10-20", "stages": ["production"]}
+    cloud.publish_run_receipt(key, value)
+    production = git.head
+    acceptance(monkeypatch)
+    assert cloud.get_run_receipt(key) is None
+    isolated = {**value, "stages": ["acceptance"]}
+    assert cloud.publish_run_receipt(key, isolated)["branch"] == "migration-acceptance"
+    assert cloud.get_run_receipt(key) == isolated
+    assert cloud.publish_run_receipt(key, isolated)["published"] == 0
+    make_model()
+    assert cloud.publish_research_assets()["branch"] == "migration-acceptance"
+    assert git.head == production
+    assert json.loads(git.content(f"migration_runs/{key}.json", production)) == value
+    assert not any(p.startswith("models/") for p in git.trees[git.commits[production]])
+
+
+def test_uncertain_acceptance_ref_reads_acceptance_without_changing_production(git, monkeypatch):
+    cloud.publish_report(report())
+    production = git.head
+    acceptance(monkeypatch)
+    git.lose_ref_response = True
+    result = cloud.publish_report(report())
+    assert result["recovered_uncertain_ref"] and result["branch"] == "migration-acceptance"
+    assert result["commit"] == git.heads["migration-acceptance"] and git.head == production
+    assert len(git.commits) == 2
+
+
+@pytest.mark.parametrize("path,method,body", [
+    ("git/refs", "POST", {"ref": "refs/heads/data", "sha": "a" * 40}),
+    ("git/refs/heads/data", "PATCH", {"sha": "a" * 40, "force": False}),
+    ("git/refs/heads/migration-acceptance", "PATCH", {"sha": "a" * 40, "force": True}),
+    ("git/refs/heads/migration-acceptance", "DELETE", {}),
+])
+def test_low_level_ref_guard_rejects_production_or_force_before_http(monkeypatch, path, method, body):
+    acceptance(monkeypatch)
+    gh = cloud.GitHub.__new__(cloud.GitHub)
+    gh.require_private = lambda: pytest.fail("Ref rejection must precede HTTP")
+    with pytest.raises(ValueError, match="拒绝"):
+        gh.api(path, method, body)
+
+
+def test_input_reads_stay_pinned_to_production_even_when_head_advances(git, monkeypatch):
+    cloud.publish_report(report())
+    make_model()
+    cloud.publish_research_assets()
+    source = "a" * 40
+    git.commits[source] = git.commits[git.head]
+    git.head = source
+    # Force reads from the remote snapshot, not files left by fixture setup.
+    for path in (data_dir() / "models").rglob("*"):
+        if path.is_file():
+            path.unlink()
+    acceptance(monkeypatch)
+    monkeypatch.setattr(cloud, "sync_checkpoint", lambda gh: {"state": "success", "day_files": 1})
+    monkeypatch.setattr(cloud, "update_compute_status", lambda gh: None)
+    original = git.api
+    def advance_after_listing(path, method="GET", body=None):
+        result = original(path, method, body)
+        if path == f"git/trees/{source}?recursive=1":
+            git.head = "b" * 40  # deliberately unreadable new head
+        return result
+    monkeypatch.setattr(git, "api", advance_after_listing)
+    git.reads.clear()
+    result = cloud.sync_reports()
+    assert result["state"] == "success", result
+    assert result["data_revision"] == {"branch": "data", "commit": source}
+    assert git.reads and all(ref == source for _, ref in git.reads)
+    assert any(path.startswith("reports/") for path, _ in git.reads)
+    assert any(path.startswith("models/") for path, _ in git.reads)

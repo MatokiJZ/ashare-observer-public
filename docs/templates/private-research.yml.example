@@ -1,72 +1,15 @@
-# INERT TEMPLATE: not an installed workflow; no credentials have been configured.
-# Do not copy into .github/workflows until the operation-specific approval,
-# actual private-storage environment protections, action pins, permissions and
-# dependency integrity are reviewed. Environment markers below do not attest
-# server-side protection. Every NOT_READY action reference must be replaced by
-# a verified full commit SHA. Do not enable scheduled runs during acceptance.
-# App installation: private storage repository only, Contents read/write and
-# Metadata read. No private Actions access is needed for new-format Releases.
-name: Private research manual acceptance (NOT_READY)
-
-on:
-  workflow_dispatch:
-    inputs:
-      mode:
-        description: Explicitly approved manual research stage
-        type: choice
-        options: [initial, update, fallback, close, train]
-        required: true
-
-permissions:
-  contents: read
-
-concurrency:
-  group: private-research-manual
-  cancel-in-progress: false
-
-jobs:
-  private-research:
-    if: github.repository == 'MatokiJZ/ashare-observer-public' && github.ref == 'refs/heads/main' && github.event_name == 'workflow_dispatch'
-    environment: private-storage
-    runs-on: ubuntu-latest
-    timeout-minutes: 15
-    steps:
-      - uses: actions/checkout@NOT_READY_VERIFY_FULL_COMMIT_SHA
-        with:
-          persist-credentials: false
-      - uses: actions/setup-python@NOT_READY_VERIFY_FULL_COMMIT_SHA
-        with:
-          python-version: '3.12'
-      - name: Check operation approval before any private credential
-        env:
-          ASHARE_PRIVATE_RUN_APPROVED: ${{ vars.ASHARE_PRIVATE_RUN_APPROVED }}
-        run: python -c 'import os,sys; sys.exit(0 if os.getenv("ASHARE_PRIVATE_RUN_APPROVED") == "1" else 2)'
-      - name: Install public dependencies
-        run: |
-          python -m pip install -r requirements.lock
-          python -m pip install --no-deps -e .
-      - name: Create scoped installation token
-        id: storage-token
-        uses: actions/create-github-app-token@NOT_READY_VERIFY_FULL_COMMIT_SHA
-        with:
-          client-id: ${{ vars.ASHARE_STORAGE_APP_CLIENT_ID }}
-          private-key: ${{ secrets.ASHARE_STORAGE_APP_PRIVATE_KEY }}
-          owner: MatokiJZ
-          repositories: ashare-observer
-          permission-contents: write
-      - name: Run approved private validation with fixed public receipt
-        env:
-          ASHARE_STORAGE_REPO: MatokiJZ/ashare-observer
-          ASHARE_COMPUTE_REPO: MatokiJZ/ashare-observer-public
-          ASHARE_COMPUTE_WORKFLOW: private-research.yml
-          ASHARE_STORAGE_TOKEN: ${{ steps.storage-token.outputs.token }}
-          ASHARE_PRIVATE_RUN_APPROVED: ${{ vars.ASHARE_PRIVATE_RUN_APPROVED }}
-          ASHARE_PROTECTED_ENVIRONMENT: private-storage
-          TASK_MODE: ${{ inputs.mode }}
-        run: python scripts/private_cloud_entry.py
-      - name: Mark cleanup scope
-        if: always()
-        run: echo 'The wrapper owns and cleans its isolated data directory. Worker output is discarded. No private files are uploaded.'
-# The App-token action revokes its generated token in its post step by default.
-# Required environment review must allow only main and prevent untrusted refs.
-# PAT is an alternative requiring separate approval, never a fallback here.
+# Reference only. Do not install this file as another workflow.
+# The reviewed manual entry is .github/workflows/private-research.yml.
+# It defaults validate_only=true: public dependencies and synthetic checks only.
+# validate_only=false requires private-storage environment review, trusted main,
+# owner trigger, ASHARE_PRIVATE_RUN_APPROVED=1 and ASHARE_ACCEPTANCE_COMMIT equal
+# to the exact approved commit. No automatic schedule is present.
+# App installation is restricted to MatokiJZ/ashare-observer with Contents write
+# and Metadata read. The App key belongs only in the protected environment's
+# ASHARE_STORAGE_APP_PRIVATE_KEY secret; never paste a key into this reference.
+# New private outputs use migration-acceptance and separate acceptance Releases.
+# The workflow verifies Linux dependency hashes before creating its short-lived
+# installation token. There is no public private-data cache or artifact upload.
+# Environment markers do not attest server-side protection. Verify branch rules
+# and the required user review in GitHub; an assistant must not approve the run.
+# A green public/synthetic job does not establish live research or storage success.

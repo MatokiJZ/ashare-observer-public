@@ -10,11 +10,14 @@ from ashare.core import TZ, atomic_json, data_dir, iso
 
 @pytest.fixture
 def pipeline(monkeypatch, calendar):
+    monkeypatch.setenv("GITHUB_ACTIONS", "false")
+    monkeypatch.delenv("ASHARE_WRITE_BRANCH", raising=False)
     at = datetime(2026, 10, 20, 8, 35, tzinfo=TZ)
     calls = []
     monkeypatch.setattr(runner.cloud, "get_run_receipt", lambda key: None)
     monkeypatch.setattr(runner.cloud, "sync_reports", lambda **kw: {
-        "state": "success", "checkpoint": {"state": "success", "day_files": 1, "source": "synthetic",
+        "state": "success", "data_revision": {"branch": "data", "commit": "a" * 40},
+        "checkpoint": {"state": "success", "day_files": 1, "source": "synthetic",
             "release_id": 7, "tag": "synthetic-version", "sha256": "synthetic-hash", "degraded": True, "failed_release_ids": [8]}})
     monkeypatch.setattr(runner.jobs, "collect", lambda *a, **kw: calendar.payload)
     monkeypatch.setattr(runner.checkpoints, "deterministic_checkpoint", lambda path: path.write_bytes(b"synthetic"))
@@ -35,6 +38,9 @@ def pipeline(monkeypatch, calendar):
         assert value["state"] == "verified" and set(value["stages"].values()) == {"verified"}
         assert value["evidence"]["input"]["restore"]["release_id"] == 7
         assert value["evidence"]["input"]["restore"]["failed_release_ids"] == [8]
+        assert value["evidence"]["input"]["data_revision"] == {"branch": "data", "commit": "a" * 40}
+        assert value["evidence"]["input_branch"] == "data"
+        assert value["evidence"]["write_branch"] == runner.cloud.write_branch()
         calls.append("receipt")
         return {"state": "verified", "files": 1}
     monkeypatch.setattr(runner.cloud, "publish_run_receipt", persist)
@@ -57,11 +63,112 @@ def test_daily_requires_all_stages_and_persists_receipt_last(pipeline):
     assert pipeline.calls == ["research", "review", "report", "assets", "checkpoint", "receipt"]
 
 
+def test_acceptance_keeps_production_source_revision_in_private_evidence(pipeline, monkeypatch):
+    monkeypatch.setenv("GITHUB_ACTIONS", "true")
+    monkeypatch.setenv("ASHARE_WRITE_BRANCH", "migration-acceptance")
+    result = runner.execute("update", pipeline.at)
+    assert result["state"] == "verified", result
+    assert pipeline.calls[-1] == "receipt"
+
+
+@pytest.mark.parametrize("branch", [None, "data", "main"])
+def test_unconfigured_actions_namespace_stops_before_any_storage_read(pipeline, monkeypatch, branch):
+    monkeypatch.setenv("GITHUB_ACTIONS", "true")
+    if branch:
+        monkeypatch.setenv("ASHARE_WRITE_BRANCH", branch)
+    monkeypatch.setattr(runner.cloud, "get_run_receipt", lambda key: pytest.fail("No storage reads before namespace check"))
+    result = runner.execute("update", pipeline.at)
+    assert result["state"] == "failed" and result["reason"] == "input_invalid"
+    assert not pipeline.calls
+
+
+@pytest.mark.parametrize("revision", [{}, {"branch": "migration-acceptance", "commit": "a" * 40},
+                                      {"branch": "data", "commit": "mutable"}])
+def test_unbound_source_revision_never_reaches_research(pipeline, monkeypatch, revision):
+    original = runner.cloud.sync_reports
+    monkeypatch.setattr(runner.cloud, "sync_reports", lambda **kw: {**original(**kw), "data_revision": revision})
+    result = runner.execute("update", pipeline.at)
+    assert result["state"] == "failed" and result["reason"] == "input_invalid"
+    assert not pipeline.calls
+
+
 def test_training_requires_real_new_model_and_private_checkpoint(pipeline):
     result = runner.execute("train", pipeline.at)
     assert result["state"] == "verified", result
     assert pipeline.calls == ["train", "assets", "checkpoint", "receipt"]
     assert result["counts"] == {"reports": 0, "models": 1, "checkpoints": 1}
+
+
+@pytest.mark.parametrize("branch,forced", [(None, False), ("data", False), ("migration-acceptance", True)])
+def test_training_force_is_limited_to_isolated_acceptance(pipeline, monkeypatch, branch, forced):
+    if branch:
+        monkeypatch.setenv("ASHARE_WRITE_BRANCH", branch)
+    train = runner.learning.train
+    arguments = []
+    def capture(**kw):
+        arguments.append(kw)
+        return train(**kw)
+    monkeypatch.setattr(runner.learning, "train", capture)
+    result = runner.execute("train", pipeline.at)
+    assert result["state"] == "verified", result
+    assert arguments == [{"at": pipeline.at, "force": forced}]
+
+
+def production_model():
+    identifier = "2026-10-19-080000-1234abcd"
+    root = data_dir() / "models" / identifier
+    atomic_json(root / "manifest.json", {
+        "id": identifier, "automatic_trading_approved": False,
+        "samples": {"train": 252, "validation": 42, "test": 63},
+        "split": {"train": ["2025-01-01"], "validation": ["2025-06-01"], "test": ["2026-10-19"]}})
+    (root / "return.txt").write_bytes(b"synthetic-existing-production-model")
+    previous = {"state": "complete", "model_id": identifier, "started_at": "2026-10-19T08:00:00+08:00", "week": "2026-W43"}
+    runner.storage.save_snapshot("training_status", previous)
+    return root, previous
+
+
+def test_same_week_production_training_is_retrained_without_overwrite_or_activation(pipeline, monkeypatch):
+    monkeypatch.setenv("GITHUB_ACTIONS", "true")
+    monkeypatch.setenv("ASHARE_WRITE_BRANCH", "migration-acceptance")
+    root, previous = production_model()
+    original = {path.name: path.read_bytes() for path in root.iterdir()}
+    control = {"active_model": previous["model_id"], "automatic_trading_approved": False}
+    runner.storage.save_snapshot("model_control", control)
+    train = runner.learning.train
+    def weekly_shortcut(**kw):
+        return train(**kw) if kw.get("force") else previous
+    monkeypatch.setattr(runner.learning, "train", weekly_shortcut)
+    result = runner.execute("train", pipeline.at)
+    assert result["state"] == "verified", result
+    assert pipeline.calls == ["train", "assets", "checkpoint", "receipt"]
+    assert {path.name: path.read_bytes() for path in root.iterdir()} == original
+    assert runner.storage.snapshot("model_control") == control
+    assert (data_dir() / "models/2026-10-20-083500-1234abcd/manifest.json").exists()
+
+
+def test_ignored_force_cannot_accept_this_weeks_production_model(pipeline, monkeypatch):
+    monkeypatch.setenv("ASHARE_WRITE_BRANCH", "migration-acceptance")
+    _, previous = production_model()
+    def reused(**kw):
+        assert kw["force"] is True
+        pipeline.calls.append("train")
+        return previous
+    monkeypatch.setattr(runner.learning, "train", reused)
+    result = runner.execute("train", pipeline.at)
+    assert result["state"] == "failed" and result["reason"] == "research_incomplete"
+    assert pipeline.calls == ["train"]
+
+
+@pytest.mark.parametrize("existing", ["models/2026-10-20-083500-1234abcd/manifest.json", "training_runs/2026-10-20-083500.json"])
+def test_acceptance_timestamp_collision_stops_before_trainer(pipeline, monkeypatch, existing):
+    monkeypatch.setenv("ASHARE_WRITE_BRANCH", "migration-acceptance")
+    path = data_dir() / existing
+    atomic_json(path, {"synthetic_existing": True})
+    before = path.read_bytes()
+    monkeypatch.setattr(runner.learning, "train", lambda **kw: pytest.fail("Do not risk overwriting synced models or runs"))
+    result = runner.execute("train", pipeline.at)
+    assert result["state"] == "failed" and result["reason"] == "research_incomplete"
+    assert path.read_bytes() == before and not pipeline.calls
 
 
 def test_existing_verified_key_skips_before_collecting(pipeline, monkeypatch):

@@ -25,7 +25,9 @@ def approved_env():
         "GITHUB_ACTIONS": "true", "GITHUB_REPOSITORY": "MatokiJZ/ashare-observer-public",
         "GITHUB_REF": "refs/heads/main", "GITHUB_EVENT_NAME": "workflow_dispatch",
         "GITHUB_SHA": "a" * 40, "GITHUB_RUN_ID": "123",
+        "GITHUB_ACTOR": "MatokiJZ", "GITHUB_TRIGGERING_ACTOR": "MatokiJZ",
         "ASHARE_STORAGE_REPO": "MatokiJZ/ashare-observer",
+        "ASHARE_WRITE_BRANCH": "migration-acceptance", "ASHARE_ACCEPTANCE_COMMIT": "a" * 40,
         "ASHARE_STORAGE_TOKEN": "synthetic-placeholder",
         "ASHARE_PRIVATE_RUN_APPROVED": "1", "ASHARE_PROTECTED_ENVIRONMENT": "private-storage",
         "TASK_MODE": "update",
@@ -55,6 +57,9 @@ def synthetic_worker(monkeypatch, entry, code):
     ("GITHUB_ACTIONS", "false"), ("GITHUB_REPOSITORY", "example/fork"),
     ("GITHUB_REF", "refs/heads/untrusted"), ("GITHUB_EVENT_NAME", "pull_request"),
     ("GITHUB_EVENT_NAME", "schedule"), ("GITHUB_SHA", "bad"),
+    ("GITHUB_ACTOR", "untrusted"), ("GITHUB_TRIGGERING_ACTOR", "untrusted"),
+    ("ASHARE_ACCEPTANCE_COMMIT", "b" * 40), ("ASHARE_ACCEPTANCE_COMMIT", ""),
+    ("ASHARE_WRITE_BRANCH", "data"), ("ASHARE_WRITE_BRANCH", ""),
     ("ASHARE_STORAGE_REPO", "example/wrong"), ("ASHARE_STORAGE_TOKEN", ""),
     ("ASHARE_PRIVATE_RUN_APPROVED", "0"), ("ASHARE_PROTECTED_ENVIRONMENT", "wrong"),
     ("TASK_MODE", "probe"),
@@ -79,7 +84,7 @@ def test_native_python_and_descendant_output_is_discarded(entry, approved_env, m
     ])
     approved_env.update(GITHUB_OUTPUT="/not/forwarded", GITHUB_TOKEN="not-forwarded",
                         PRIVATE_ACCOUNT_EMAIL="not-forwarded", ASHARE_DATA_DIR="/not/user/data",
-                        PYTHONSTARTUP="/not/forwarded")
+                        PYTHONSTARTUP="/not/forwarded", ASHARE_CHECKPOINT_PREFIX="not-forwarded")
     calls = synthetic_worker(monkeypatch, entry, code)
     result, exitcode = entry.run(approved_env)
     captured = capfd.readouterr()
@@ -87,9 +92,11 @@ def test_native_python_and_descendant_output_is_discarded(entry, approved_env, m
     assert exitcode == 0 and result["accepted"]
     assert len(calls) == 1
     worker_env = calls[0]["env"]
-    assert not any(key in worker_env for key in ("GITHUB_OUTPUT", "GITHUB_TOKEN", "PRIVATE_ACCOUNT_EMAIL", "PYTHONSTARTUP"))
+    assert not any(key in worker_env for key in ("GITHUB_OUTPUT", "GITHUB_TOKEN", "PRIVATE_ACCOUNT_EMAIL", "PYTHONSTARTUP", "ASHARE_CHECKPOINT_PREFIX"))
     assert not Path(calls[0]["cwd"]).exists()
     assert worker_env["ASHARE_DATA_DIR"] != approved_env["ASHARE_DATA_DIR"]
+    assert worker_env["ASHARE_WRITE_BRANCH"] == "migration-acceptance"
+    assert worker_env["ASHARE_ACCEPTANCE_COMMIT"] == approved_env["GITHUB_SHA"]
 
 
 def test_timeout_kills_group_and_cleans_temp(entry, approved_env, monkeypatch, capfd):
@@ -168,16 +175,46 @@ def test_exception_payload_does_not_reach_public_output(entry, approved_env, mon
     assert capfd.readouterr().err == ""
 
 
-def test_template_is_inert_and_secret_task_is_main_only():
+def test_template_points_to_the_single_manual_entry():
     root = Path(__file__).resolve().parents[1]
-    path = root / "docs/templates/private-research.yml.example"
-    text = path.read_text()
-    assert "NOT_READY" in text and "workflow_dispatch:" in text
-    assert "refs/heads/main" in text and "environment: private-storage" in text
-    assert "contents: read" in text and "persist-credentials: false" in text
-    assert "runs-on: ubuntu-latest" in text
-    assert text.index("Install public dependencies") < text.index("Create scoped installation token")
-    for forbidden in ("schedule:", "pull_request:", "pull_request_target:", "upload-artifact", "cache:", "actions: write"):
+    text = (root / "docs/templates/private-research.yml.example").read_text()
+    assert ".github/workflows/private-research.yml" in text
+    assert "validate_only=true" in text and "ASHARE_ACCEPTANCE_COMMIT" in text
+    assert all(not line or line.startswith("#") for line in text.splitlines())
+
+
+def test_manual_workflow_fixed_actions_and_private_boundary():
+    root = Path(__file__).resolve().parents[1]
+    text = (root / ".github/workflows/private-research.yml").read_text()
+    public, private = text.split("  private-research:\n", 1)
+    pinned = {
+        "actions/checkout": "11d5960a326750d5838078e36cf38b85af677262",
+        "actions/setup-python": "a26af69be951a213d495a4c3e4e4022e16d87065",
+        "actions/create-github-app-token": "64ab729a6294000f5aa4a4bc0b73d1f32bc45510",
+    }
+    actions = re.findall(r"uses: ([^@\s]+)@([^\s]+)", text)
+    assert actions and all(pinned.get(name) == commit for name, commit in actions)
+    assert set(name for name, _ in actions) == set(pinned)
+    assert "workflow_dispatch:" in text and "default: true" in text
+    assert "options: [initial, update, fallback, close, train]" in text
+    assert "inputs.validate_only == false" in private
+    assert "needs: public-dependency-validation" in private
+    assert "environment:" not in public and "secrets." not in public
+    assert "environment: private-storage" in private
+    assert "ASHARE_WRITE_BRANCH: migration-acceptance" in private
+    assert "ASHARE_ACCEPTANCE_COMMIT" in private and "== sha" in private
+    assert "owner: MatokiJZ" in private and "repositories: ashare-observer" in private
+    assert "permission-contents: write" in private and "skip-token-revoke: false" in private
+    assert private.index("Check operation and reviewed commit") < private.index("Create scoped installation token")
+    assert private.index("Install public dependencies") < private.index("Create scoped installation token")
+    assert "scripts/private_cloud_entry.py" in private
+    for job in (public, private):
+        assert "github.ref == 'refs/heads/main'" in job
+        assert "github.actor == 'MatokiJZ'" in job
+        assert "github.triggering_actor == 'MatokiJZ'" in job
+        assert "ref: ${{ github.sha }}" in job and "persist-credentials: false" in job
+        assert "runs-on: ubuntu-latest" in job
+    for forbidden in ("schedule:", "pull_request:", "pull_request_target:", "upload-artifact",
+                      "cache:", "actions: write", "id-token:", "permission-actions:"):
         assert forbidden not in text
-    assert not re.search(r"^\s+contents: write$", text, re.M)
-    assert not (root / ".github/workflows/private-research.yml").exists()
+    assert "contents: read" in text and not re.search(r"^\s+contents: write$", text, re.M)

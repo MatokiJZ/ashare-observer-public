@@ -21,6 +21,17 @@ def in_actions() -> bool:
     return os.getenv("GITHUB_ACTIONS", "").lower() == "true"
 
 
+def write_branch() -> str:
+    """Production input stays on data; Actions acceptance writes are isolated."""
+    value = os.getenv("ASHARE_WRITE_BRANCH", "").strip()
+    if in_actions() and value != "migration-acceptance":
+        raise ValueError("云端验收必须显式写入 migration-acceptance 隔离分支")
+    branch = value or "data"
+    if branch not in {"data", "migration-acceptance"}:
+        raise ValueError("私有写入分支不在允许范围")
+    return branch
+
+
 def storage_repository(repository: str | None = None) -> str:
     """Keep the public compute repository out of the private data path."""
     storage = os.getenv("ASHARE_STORAGE_REPO", "").strip()
@@ -84,6 +95,11 @@ class GitHub:
     def api(self, path: str, method="GET", body=None):
         method = method.upper()
         if method != "GET":
+            branch = write_branch()
+            if path == "git/refs" and (method != "POST" or (body or {}).get("ref") != f"refs/heads/{branch}"):
+                raise ValueError("拒绝创建隔离目标以外的引用")
+            if path.startswith("git/refs/") and (method != "PATCH" or path != f"git/refs/heads/{branch}" or (body or {}).get("force") is not False):
+                raise ValueError("拒绝修改隔离目标以外的引用")
             # Recheck before every mutation in case visibility changed mid-run.
             self.require_private()
         if path == "git/commits" and method == "POST":
@@ -198,7 +214,15 @@ def sync_reports(recent_sessions: int | None = None) -> dict:
         except Exception as exc:
             status["checkpoint"] = {"state": "failed", "error": str(exc)[:250]}
         update_compute_status(gh)
-        tree = gh.api("git/trees/data?recursive=1")
+        # Bind all report/model input reads to one production revision, even if
+        # a daily job advances data while this manual acceptance run is reading.
+        source = gh.api("git/ref/heads/data")["object"]["sha"]
+        if not re.fullmatch(r"[a-f0-9]{40}", source):
+            raise ValueError("生产数据版本无效")
+        status["data_revision"] = {"branch": "data", "commit": source}
+        tree = gh.api(f"git/trees/{source}?recursive=1")
+        if tree.get("truncated"):
+            raise ValueError("生产数据目录不完整")
         files = [r["path"] for r in tree.get("tree", []) if re.fullmatch(r"reports/\d{4}-\d{2}-\d{2}-\d{6}-[a-z]+\.json", r["path"])]
         cutoff = ""
         if recent_sessions:
@@ -211,8 +235,8 @@ def sync_reports(recent_sessions: int | None = None) -> dict:
         for path in sorted(files):
             if (data_dir() / path).exists():
                 continue
-            raw = gh.content(path)
-            manifest = json.loads(gh.content(path + ".manifest"))
+            raw = gh.content(path, branch=source)
+            manifest = json.loads(gh.content(path + ".manifest", branch=source))
             import_report(raw, manifest["sha256"])
             imported += 1
         research = [r["path"] for r in tree.get("tree", []) if research_asset(r["path"])]
@@ -228,8 +252,8 @@ def sync_reports(recent_sessions: int | None = None) -> dict:
                 expected = read_json(target.parent/"manifest.json",{}).get("files",{}).get(target.name)
                 if expected == digest(target.read_bytes()):
                     continue
-            raw = gh.content(path)
-            receipt = json.loads(gh.content(path+".manifest"))
+            raw = gh.content(path, branch=source)
+            receipt = json.loads(gh.content(path+".manifest", branch=source))
             if digest(raw) != receipt["sha256"]:
                 raise ValueError("研究附件完整性校验失败")
             target.parent.mkdir(parents=True,exist_ok=True)
@@ -304,9 +328,9 @@ def _verify_files(gh, files: dict[str, bytes], branch="data"):
             raise ValueError("私有文件写后回读校验失败")
 
 
-def _data_parent(gh):
+def _data_parent(gh, branch):
     try:
-        parent = gh.api("git/ref/heads/data")["object"]["sha"]
+        parent = gh.api(f"git/ref/heads/{branch}")["object"]["sha"]
         base = gh.api(f"git/commits/{parent}")["tree"]["sha"]
         tree = gh.api(f"git/trees/{base}?recursive=1")
         if tree.get("truncated"):
@@ -315,16 +339,17 @@ def _data_parent(gh):
     except httpx.HTTPStatusError as exc:
         # Only a missing branch is a valid empty repository. Other missing
         # objects indicate a failed/inconsistent read and must not erase history.
-        if exc.response.status_code == 404 and exc.request.url.path.endswith("/git/ref/heads/data"):
+        if exc.response.status_code == 404 and exc.request.url.path.endswith(f"/git/ref/heads/{branch}"):
             return None, None, {}
         raise
 
 
 def _publish_immutable(gh, files: dict[str, bytes], message: str):
+    branch = write_branch()
     if not files:
         return {"state": "empty", "files": 0, "published": 0}
     for attempt in range(3):
-        parent, base, existing = _data_parent(gh)
+        parent, base, existing = _data_parent(gh, branch)
         changed = []
         published = 0
         for path, raw in sorted(files.items()):
@@ -343,7 +368,7 @@ def _publish_immutable(gh, files: dict[str, bytes], message: str):
             published += 1
         if not changed:
             _verify_files(gh, files, branch=parent)
-            return {"state": "verified", "files": len(files), "published": 0, "commit": parent}
+            return {"state": "verified", "files": len(files), "published": 0, "commit": parent, "branch": branch}
         body = {"tree": changed}
         if base:
             body["base_tree"] = base
@@ -351,9 +376,9 @@ def _publish_immutable(gh, files: dict[str, bytes], message: str):
         commit = gh.api("git/commits", "POST", {"message": message, "tree": tree["sha"], "parents": [parent] if parent else []})
         try:
             if parent:
-                gh.api("git/refs/heads/data", "PATCH", {"sha": commit["sha"], "force": False})
+                gh.api(f"git/refs/heads/{branch}", "PATCH", {"sha": commit["sha"], "force": False})
             else:
-                gh.api("git/refs", "POST", {"ref": "refs/heads/data", "sha": commit["sha"]})
+                gh.api("git/refs", "POST", {"ref": f"refs/heads/{branch}", "sha": commit["sha"]})
         except httpx.HTTPStatusError as exc:
             if exc.response.status_code not in (409, 422) or attempt == 2:
                 raise
@@ -361,17 +386,18 @@ def _publish_immutable(gh, files: dict[str, bytes], message: str):
         except httpx.TransportError:
             # A ref update may have executed despite a lost response. Check the
             # actual branch once; never blindly repeat an uncertain mutation.
-            actual = gh.api("git/ref/heads/data")["object"]["sha"]
+            actual = gh.api(f"git/ref/heads/{branch}")["object"]["sha"]
             _verify_files(gh, files, branch=actual)
-            return {"state": "verified", "files": len(files), "published": published, "commit": actual, "recovered_uncertain_ref": True}
-        actual = gh.api("git/ref/heads/data")["object"]["sha"]
+            return {"state": "verified", "files": len(files), "published": published, "commit": actual, "branch": branch, "recovered_uncertain_ref": True}
+        actual = gh.api(f"git/ref/heads/{branch}")["object"]["sha"]
         _verify_files(gh, files, branch=actual)
-        return {"state": "verified", "files": len(files), "published": published, "commit": actual}
+        return {"state": "verified", "files": len(files), "published": published, "commit": actual, "branch": branch}
     raise ValueError("私有数据并发写入未完成")
 
 
 def publish_research_assets():
     """Publish and read back immutable research files; never accounts/controls."""
+    write_branch()
     for path in (data_dir() / "reviews").glob("????-??-??.json"):
         review = read_json(path)
         if review.get("execution"):
@@ -408,10 +434,11 @@ def _run_receipt_path(key, value=None):
 
 
 def get_run_receipt(key: str):
+    branch = write_branch()
     path = _run_receipt_path(key)
     gh = GitHub()
     try:
-        parent = gh.api("git/ref/heads/data")["object"]["sha"]
+        parent = gh.api(f"git/ref/heads/{branch}")["object"]["sha"]
         raw = gh.content(path, branch=parent)
     except httpx.HTTPStatusError as exc:
         if exc.response.status_code == 404:
@@ -426,6 +453,7 @@ def get_run_receipt(key: str):
 
 
 def publish_run_receipt(key: str, value: dict):
+    write_branch()
     path = _run_receipt_path(key, value)
     raw = json.dumps(value, ensure_ascii=False, sort_keys=True, allow_nan=False).encode()
     return _publish_immutable(GitHub(), {path: raw}, "Verified private migration receipt")
@@ -513,6 +541,7 @@ def bootstrap_checkpoint(gh: GitHub):
 
 def publish_report(report: dict):
     """Validate, publish immutably and verify the bytes read from private storage."""
+    write_branch()
     validate_report(report)
     raw = json.dumps(report, ensure_ascii=False, indent=2, allow_nan=False).encode()
     path = f"reports/{report['id']}.json"
