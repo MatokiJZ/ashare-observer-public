@@ -1,73 +1,67 @@
-# 日报与周训练迁移方案（待验证）
+# 日报与周训练迁移：实现及验收边界
 
-目前仅完成公开代码和隔离测试的发布，以及迁移安全边界的准备。**日报、周训练及私有数据尚未完成真实迁移**。本阶段不新增定时触发、不配置凭据、不关闭原工作流，也不部署本机程序。公开测试通过或合成演练通过，均不代表真实数据链路已经可用。
+已实现并合成测试存储、编排和日志隔离代码。**尚未创建 App、配置凭据/Environment，也未运行真实私有数据端到端验收。** 公开工作流仍只有代码 CI 和手动合成验证；没有新增 cron，没有停用旧任务，没有部署本机程序。绿色合成测试不代表真实日报、训练或收益验证完成。
 
-## 推荐架构与尚缺功能
+## 已实现的链路
 
-| 环节 | 目标与边界 | 当前缺口 |
+| 环节 | 实现与证据边界 |
+| --- | --- |
+| 私有目标 | `ASHARE_STORAGE_REPO` 明确指定原私库；初始化及写前核验仓库身份与私有状态。Actions 仅读专用 `ASHARE_STORAGE_TOKEN`，不回退公开仓令牌或本机登录 |
+| 报告/模型 | 私有 `data` 分支不可变文件与哈希清单；写入后按实际 commit 回读内容、长度、哈希和 schema；同名变化拒绝覆盖，重复仍需校验 |
+| 检查点 | 确定性压缩包、内容哈希版本；先建私有草稿 Release，上传检查点和清单，下载验证后才发布；不删除或覆盖既有文件 |
+| 输入恢复 | 优先新格式私有 Release，最近两版验证后恢复，降级显式记录。没有新格式时才读取原私有 bootstrap Release，先全包验证再导入。陈旧数据不能自动成为合格信号 |
+| 重复与故障 | 上传/更新响应不确定先查实际状态；完整回读后写私有 `migration_runs` 完成回执。重复日/模式跳过，不作为新的验收。相同周模型可恢复后续存储，但标记 `reused_training`，不冒充重新训练 |
+| 手动编排 | 真实函数连接恢复、日历、研究/训练、复盘、发布、检查点和完成回执；部分/空/陈旧覆盖、样本不足、回读失败都不会通过。过时盘前任务拒绝生成准时信号 |
+| 日志隔离 | 独立主进程将 worker 的 Python、native 和后代进程 stdout/stderr 直接丢弃；公开只输出固定枚举状态和有上限的整数计数；不保留原始错误/详细日志 |
+| 临时数据 | worker 使用新建临时目录、最小环境，不能指定用户数据目录；不传入 GitHub workflow command 文件或无关凭据。超时结束进程组并清理目录 |
+| 本地读取 | 代码已能读取新 Release；`ASHARE_COMPUTE_REPO` 匿名读取公开任务状态，不发送私库 token。共享工作流状态注明未区分日报/训练；本机运行副本尚未更新 |
+
+检查点哈希与日期验证证明传输完整性，不证明行情、复权、公司行动或模型经济含义正确。全市场有效覆盖仍由报告评估；当前股票池、历史数据及既有模型研究偏差仍在，本批不调策略、不启用模型、不修改模拟本金或风险参数。
+
+## 权限与待操作时确认的配置
+
+推荐 App 仅安装到 `MatokiJZ/ashare-observer`，首版权限缩减为 **Contents 读写、Metadata 只读**。新检查点和原 bootstrap 均使用 Release，无需 Actions 权限。[Release API 权限](https://docs.github.com/en/rest/releases/releases)
+
+旧 Actions artifact 兼容仅在显式 `ASHARE_LEGACY_ARTIFACTS=1` 时开启，才需要 Actions 读取；默认封装不传此变量，不要求这项授权。Contents 写权限无法限制到单个分支或 Release，并包含删除能力；代码不调用删除不等于权限层面没有删除能力。
+
+待单独确认的具体动作：
+
+1. 创建仅用于该项目的 GitHub App，建议名 `MatokiJZ-ashare-private-storage`（创建时再查可用性）；主页指向公开代码仓库；关闭 webhook，无用户 OAuth/账户权限，无额外事件订阅。
+2. 只安装到上述私有仓库，授予 Contents 读写、Metadata 只读，不选全部仓库，不授予 Workflows、Actions 或 Administration。
+3. 在公开仓库创建 `private-storage` Environment，分支策略只允许 `main`，首次真实验收要求用户手动批准。核实实际服务端规则，不能用环境变量标记代替保护；不默默取消审批来启用定时。
+4. 经确认后生成 App 私钥，直接保存为该 Environment 的 `ASHARE_STORAGE_APP_PRIVATE_KEY` Secret；Client ID 保存为 `ASHARE_STORAGE_APP_CLIENT_ID` 变量。不得通过聊天、源码或日志传递私钥。安装令牌只按运行生成并以 `ASHARE_STORAGE_TOKEN` 传给 worker，通常最长一小时并由 Action 结束时撤销。
+5. 手动运行前另确认本次模式、代码版本、时段和 `ASHARE_PRIVATE_RUN_APPROVED=1`。当前未设置批准变量，也未安装真实 workflow。
+
+[GitHub App 工作流认证](https://docs.github.com/en/apps/creating-github-apps/authenticating-with-a-github-app/making-authenticated-api-requests-with-a-github-app-in-a-github-actions-workflow)说明内置 GITHUB_TOKEN 仅能访问运行仓库；[Environment 保护](https://docs.github.com/en/actions/how-tos/deploy/configure-and-manage-deployments/manage-environments)用于限制凭据可用范围。短期替代是同仓库、同权限且建议 30 天有效的 fine-grained PAT，仍须单独确认；本实现不自动回退到 PAT。
+
+## 真实入口与公开输出
+
+`docs/templates/private-research.yml.example` 只是**不可执行模板**：位于 docs，Actions 引用为 `NOT_READY`，只手动触发、main-only、标准 Ubuntu、`contents: read`，没有 schedule、artifact 或 cache。不能直接复制使用。必须先核验/固定所有 Actions 的完整 SHA、依赖完整性和 Environment 保护，再单独批准安装及手动验收。
+
+模板先安装公开依赖，再生成仅限私库的安装令牌；令牌只给固定入口步骤。PR/fork 测试从不接触私有环境。封装拒绝仓库、分支、事件、模式、批准标记或凭据不符合的情况；这些标记只是额外校验，不能声称实际环境保护已配置。原 `scripts/cloud_task.py` 继续在 Actions 中无条件拒绝。
+
+公开输出不包含原始数据、模型、旧提交信息、个人姓名/邮箱、路径或异常全文。私有原始输出直接丢弃，诊断粒度因此仅剩安全阶段/错误分类；不存在可下载的详细日志。受信任 worker 及依赖本身仍能访问处理所需私有数据，所以代码审查、依赖审核和最小权限不可由日志封装替代。公开仓库归属账号仍可见，不能承诺匿名。
+
+## 真实端到端验收仍待完成
+
+分别手动验证日报与周训练，记录证据但只保存在私库：
+
+- 实际私有输入来源、版本、哈希、非空文件数、数据截止日和交易日历；bootstrap 若过旧，明确失败或继续修复，不宣称已可用。
+- 实际采集和报告/复盘，以及合格时间切分、拟合、验证、测试及模型文件；`partial`、`insufficient`、休市、复用旧模型或已有回执跳过，均不能当完整新验收。
+- 实际私有报告/模型/检查点发布与下载回读；读取端使用新格式；检查公开分支、运行元数据和日志没有私人内容，artifact/cache 没有私有数据。
+- 权限失败、超时、损坏检查点、过时数据和并发冲突有明确失败/恢复证据。输入损坏不导入；旧有效版本不删除。损坏或不确定状态不能被忽略。
+- 记录实际耗时、包大小/增长、数据源可用性和私有 Release 容量。每包上限 100 MiB、解包上限 800 MiB/7000 文件；没有自动清理旧数据，长期保留和容量策略须在启用 cron 前确定。
+
+此后才提出切换建议，另行确认启用计划触发、停用被替代旧任务和本机读取部署。代码迁移不等于数据服务迁移，完整训练不等于可盈利或可交易。供应商批量数据/新闻/财务的再分发许可仍未核实，所有相关数据保持私有。
+
+## 计划时刻（未启用）
+
+| 工作 | 北京时间 | UTC cron |
 | --- | --- | --- |
-| 计算 | 公开仓库的标准 Ubuntu runner；私有输入只进入一次性临时目录；不运行持续盘中模拟 | 待授权后手动验证真实采集、日报、复盘及训练的全部阶段 |
-| 报告与模型 | 继续写入原私有仓库的 `data` 分支；不向公开代码仓库提交研究数据 | 需验证明确的存储目标、私有性校验、不可变版本与写后回读 |
-| 历史检查点 | 新检查点写入原私有仓库的专用 Release asset；清单包含格式版本、文件哈希、数据截止日和来源 | 私有 Release 检查点发布、校验加载与可靠回退尚未完成 |
-| 旧检查点兼容 | 暂时只读原私有仓库的 Actions artifact 和 bootstrap Release | 仍需接入新旧选择顺序、完整性检查与回退规则；不能直接复制公开工作流的 `upload-artifact` |
-| 本机读取与状态 | 数据仍从原私库读取；执行状态来自公开计算仓库 | 本机读取新检查点格式、计算源与存储源分离尚待实现及验证；本阶段不部署 |
+| initial | 每日 07:35 | `35 23 * * *` |
+| update | 每日 08:35 | `35 0 * * *` |
+| fallback | 每日 09:05 | `5 1 * * *` |
+| close | 每日 16:10 | `10 8 * * *` |
+| train | 周六 08:00 | `0 0 * * 6` |
 
-原始行情、财务、新闻、模型和研究报告默认保持私有。没有供应商再分发许可，不能因为计算迁到公开仓库就公开批量数据。公开仓库的 artifact、cache、日志和提交元数据都属于需要检查的输出面；artifact 不作为私有跨仓存储使用。[GitHub artifact 访问说明](https://docs.github.com/en/actions/how-tos/manage-workflow-runs/download-workflow-artifacts)
-
-## 权限与公开输出约束
-
-现有公开工作流的 `GITHUB_TOKEN` 仅用于公开代码读取，不能据此访问另一个私有仓库。推荐另行批准一个 GitHub App，**仅安装到原私有仓库**：
-
-- `Contents: read and write`：读取并发布私有数据分支、Release 和 asset。
-- `Actions: read`：兼容读取旧检查点与旧运行状态；不授予写权限，不清理旧记录。
-- `Metadata: read`：识别仓库及校验其私有状态。
-- 不授予 Workflows、Administration、成员管理或其他仓库访问权限。`Contents` 写权限本身不能限定为仅一个分支；代码白名单不能替代这个权限事实。
-
-本阶段不创建 App、不生成或上传私钥、不配置 PAT 或其他持久凭据。未来若获批准，App 私钥存入公开仓库**受保护的 environment secret**，在运行时换取短期 installation token；不得写入文件、日志或提交。environment 必须限制主分支，并在首次真实运行前复核保护规则。只有主分支手动任务及最终批准的定时任务可进入该环境，PR、fork 和任意输入 ref 不得进入。需要明确人工批准要求与自动定时运行是否兼容，不默认取消保护。
-
-具体配置提案为公开仓库的 `private-storage` environment：App 私钥 secret 名 `ASHARE_STORAGE_APP_PRIVATE_KEY`，Client ID 变量名 `ASHARE_STORAGE_APP_CLIENT_ID`；生成的 installation token 仅以进程环境 `ASHARE_STORAGE_TOKEN` 传给存储客户端。App 只授权原私库，安装令牌最长通常为 1 小时，私钥仍是需要保护和撤销管理的长期凭据。显式 `ASHARE_STORAGE_REPO` 指向原私库，不能指向当前公开计算仓库。[GitHub App 工作流认证](https://docs.github.com/en/apps/creating-github-apps/authenticating-with-a-github-app/making-authenticated-api-requests-with-a-github-app-in-a-github-actions-workflow)
-
-短期验证的替代方案是仅选择原私库、同等权限的 fine-grained PAT，建议有效期 30 天，存为上述 environment 的 `ASHARE_STORAGE_TOKEN` secret。这更容易设置，但到期必须人工续期，且长期个人令牌风险不同于每次运行的短期安装令牌。两种方式都须单独批准；不要在聊天、仓库文件或命令输出中粘贴秘密。`Contents` 读写还包含修改或删除内容的能力，客户端不主动删除不等于权限层面禁止删除。
-
-真实任务启用前，还必须做到：
-
-- 所有第三方 Actions 固定到已审核的完整提交 SHA，依赖固定版本并核对完整性；这属于启用条件，不能把目前普通代码 CI 误称为已满足。
-- 公开日志只允许固定阶段名、状态与经审核的计数；供应商原文、异常全文、签名下载 URL、输入内容和私有路径只保存到私有详细记录。失败时不回显原始 traceback。
-- 不上传原始数据、模型或详细健康记录到公开 artifact，不把这些内容纳入 Actions cache；临时文件在结束时清理。不能把事后删除日志当作防泄露措施。
-- 数据提交显式使用经过核实的机器人或 noreply 作者及提交者；不继承旧历史或复制个人身份字段。公开仓库归属账号仍然可见，不能承诺匿名。[GitHub 提交邮箱设置](https://docs.github.com/en/account-and-profile/how-tos/email-preferences/setting-your-commit-email-address)
-- 读取或写入私有数据前，核验目标仓库与私有状态；配置缺失、目标错误或权限不足时停止，不回退到公开运行仓库。
-
-## 计划时刻（尚未启用）
-
-| 工作 | 北京时间 | 对应 UTC cron | 预期职责 |
-| --- | --- | --- | --- |
-| 日报 initial | 每日 07:35 | `35 23 * * *` | 盘前初版研究；UTC 日期为前一天 |
-| 日报 update | 每日 08:35 | `35 0 * * *` | 盘前更新 |
-| 日报 fallback | 每日 09:05 | `5 1 * * *` | 检查更新结果并按既定规则补跑 |
-| 日报 close | 每日 16:10 | `10 8 * * *` | 收盘数据、报告与复盘 |
-| 周训练 | 每周六 08:00 | `0 0 * * 6` | 用合格历史数据训练并评估候选模型；不自动启用模型 |
-
-表中的 cron 仅记录未来计划，当前不向工作流添加 `schedule`。日报依交易日历判断休市；休市跳过必须明确标记，不能算作完整采集验收。
-
-GitHub cron 不是准点服务，繁忙时可能延迟，严重时可能丢弃排队任务；公开仓库长期无活动时，定时工作流可能在 60 天后停用。需要检查“本次应生成的结果是否存在”并提供有界手动补跑；过时盘前任务不能冒充准时信号。故障不自动触发无限重试。这些定时研究任务不是连续盘中模拟。
-
-## 首次真实验收与切换条件
-
-先完成无敏感输入的隔离测试，再在获批的私有授权下分别手动运行日报和周训练。以下条件全部有证据，才允许提出切换建议：
-
-1. **输入恢复**：记录选中的私有检查点来源、版本、哈希、数据日期、文件数；检查非空、schema、交易日历覆盖和所需历史区间。同步失败、旧数据不足或错误回退必须阻止验收通过。
-2. **完整执行**：日报实际经过采集、历史恢复/更新、选股报告、复盘与检查点生成；训练实际形成合格时间切分、拟合、验证、测试和模型文件。`partial`、`insufficient`、休市跳过、复用旧结果及空数据测试分别标记，不能用绿色工作流代替完成证据。训练完成也不代表策略盈利或允许自动交易。
-3. **私有发布与回读**：报告、模型、检查点和清单均写到指定私库；用读取端重新下载，核对非空、schema、哈希、截止日期和模型/报告版本。确认没有原始数据或个人信息写入公开分支、artifact、cache、日志或提交身份。
-4. **失败恢复**：验证权限失败、检查点损坏/过旧、部分采集、超时及并发写入冲突；保留上个有效版本，并明确本次未完成。禁止把陈旧数据作为当天正常结果，禁止覆盖已发布版本或循环重试。
-5. **成本与运行责任**：记录标准 runner 的实际时长、私有检查点增长量、读取方式及外部接口调用；确认大小上限、保留周期、失败提醒和未来容量处理方案。不能默认删除旧数据，也不能以标准公开 runner 免费推定存储和外部服务全部免费。[GitHub Actions 计费说明](https://docs.github.com/en/billing/concepts/product-billing/github-actions)
-
-随后给出实际验收记录和精确切换步骤，由用户确认后，才启用五个计划时刻并停用已被替代的原私有任务。新旧任务不得同时持续采集或训练；任一步未完成时，原工作流保持现状。代码测试迁移不等于日报、周训练已经迁移。
-
-## 待首次明确批准的事项
-
-- 是否按上述范围创建并安装 GitHub App；接受原私库 `Contents` 写权限无法仅限数据分支的事实。
-- 是否将 App 私钥存入指定受保护 environment，以及主分支限制、审批与定时运行的具体保护设置。
-- 是否允许公开 runner 临时处理私有输入，并仅写回指定私库；私有 Release 容量、保留期限和后续清理操作另行确定。
-- 私有检查点读写、本机兼容及全部验收完成后，是否授权启用计划触发并停用对应旧任务；本机程序部署仍需单独明确范围。
-
-旧仓库保持私有，旧历史、artifact、Release 和日志不删除；开发目录未提交改动不随迁移自动发布。公开内容一旦被获取，事后删除或改写无法保证收回，因此保护必须在输出前生效。[GitHub 敏感数据移除的限制](https://docs.github.com/en/authentication/keeping-your-account-and-data-secure/removing-sensitive-data-from-a-repository)
+GitHub cron 可能延迟或丢弃任务，公开仓库长期无活动还可能停用；它不是准点服务，也不是连续盘中模拟。[调度规则](https://docs.github.com/en/actions/reference/workflows-and-actions/events-that-trigger-workflows) 原三个私有工作流继续保持现状，实际运行仍可能消耗私有 Actions 额度；公开标准 runner 的免费计算不代表私有存储或外部调用费用为零。[计费边界](https://docs.github.com/en/billing/concepts/product-billing/github-actions)

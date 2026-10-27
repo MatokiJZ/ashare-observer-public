@@ -144,6 +144,48 @@ def import_report(raw: bytes, expected_hash: str) -> bool:
     return newer
 
 
+def update_compute_status(gh):
+    """Fetch public run metadata without ever forwarding the private data token."""
+    compute = os.getenv("ASHARE_COMPUTE_REPO", "").strip()
+    client = None
+    try:
+        if compute:
+            if not re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", compute) or compute.casefold() == gh.repo.casefold():
+                raise ValueError("计算仓库配置无效")
+            client = httpx.Client(base_url="https://api.github.com", headers={"Accept": "application/vnd.github+json"}, timeout=20, follow_redirects=False, trust_env=False)
+            response = client.get(f"/repos/{compute}")
+            response.raise_for_status()
+            metadata = response.json()
+            if metadata.get("private") is not False or metadata.get("full_name", "").casefold() != compute.casefold():
+                raise ValueError("计算仓库不是预期公开仓库")
+        workflow_override = os.getenv("ASHARE_COMPUTE_WORKFLOW", "private-research.yml")
+        if client and not re.fullmatch(r"[A-Za-z0-9_.-]+\.ya?ml", workflow_override):
+            raise ValueError("计算工作流配置无效")
+        for key, legacy_workflow in (("cloud_status", "cloud-research.yml"), ("training_cloud_status", "model-training.yml")):
+            workflow = workflow_override if client else legacy_workflow
+            try:
+                path = f"actions/workflows/{workflow}/runs?per_page=1"
+                if client:
+                    response = client.get(f"/repos/{compute}/{path}")
+                    response.raise_for_status()
+                    payload = response.json()
+                else:
+                    payload = gh.api(path)
+                latest = next(iter(payload.get("workflow_runs", [])), {})
+                save_snapshot(key, {"checked_at": iso(), "source": "public_compute" if client else "legacy_private_compute",
+                    "status": latest.get("status"), "conclusion": latest.get("conclusion"),
+                    "created_at": latest.get("created_at"), "run_id": latest.get("id"),
+                    "notice": ("共享计算工作流的最近运行，未按日报与训练模式区分；" if client else "") + "运行状态不代表数据或策略验收通过；当天无有效报告时不使用旧报告交易。"})
+            except Exception:
+                save_snapshot(key, {"checked_at": iso(), "state": "unavailable", "error": "workflow_status_unavailable"})
+    except Exception:
+        for key in ("cloud_status", "training_cloud_status"):
+            save_snapshot(key, {"checked_at": iso(), "state": "unavailable", "error": "compute_repository_unverified"})
+    finally:
+        if client:
+            client.close()
+
+
 def sync_reports(recent_sessions: int | None = None) -> dict:
     status = {"state": "running", "started_at": iso()}
     save_snapshot("sync_status", status)
@@ -155,21 +197,7 @@ def sync_reports(recent_sessions: int | None = None) -> dict:
             status["checkpoint"] = sync_checkpoint(gh)
         except Exception as exc:
             status["checkpoint"] = {"state": "failed", "error": str(exc)[:250]}
-        try:
-            runs = gh.api("actions/workflows/cloud-research.yml/runs?per_page=5").get("workflow_runs", [])
-            latest = runs[0] if runs else {}
-            save_snapshot("cloud_status", {"checked_at": iso(), "status": latest.get("status"), "conclusion": latest.get("conclusion"),
-                                          "created_at": latest.get("created_at"), "url": latest.get("html_url"), "notice": "失败、额度不足或调度漏跑请查看云端任务记录；当天无报告时不使用旧报告交易。"})
-        except Exception as exc:
-            save_snapshot("cloud_status", {"checked_at": iso(), "error": str(exc)[:180]})
-        try:
-            runs = gh.api("actions/workflows/model-training.yml/runs?per_page=1").get("workflow_runs", [])
-            latest = runs[0] if runs else {}
-            save_snapshot("training_cloud_status", {"checked_at":iso(), "status":latest.get("status"),
-                "conclusion":latest.get("conclusion"), "created_at":latest.get("created_at"), "url":latest.get("html_url"),
-                "notice":"云端超时、额度阻断或失败时保留有效模型；详细原因见任务记录。"})
-        except Exception as exc:
-            save_snapshot("training_cloud_status", {"checked_at":iso(), "error":str(exc)[:180]})
+        update_compute_status(gh)
         tree = gh.api("git/trees/data?recursive=1")
         files = [r["path"] for r in tree.get("tree", []) if re.fullmatch(r"reports/\d{4}-\d{2}-\d{2}-\d{6}-[a-z]+\.json", r["path"])]
         cutoff = ""
@@ -228,58 +256,204 @@ def research_asset(path):
         or re.fullmatch(r"cloud_reviews/\d{4}-\d{2}-\d{2}-[a-f0-9]{16}\.json",path))
 
 
+def validate_research_payloads(assets: dict[str, bytes]):
+    """Check complete model bundles and receipt schemas without activating models."""
+    models = {path.split("/")[1] for path in assets if path.startswith("models/")}
+    for identifier in models:
+        prefix = f"models/{identifier}/"
+        expected = {prefix + name for name in ("manifest.json", "return.txt", "risk.txt")}
+        if not expected.issubset(assets):
+            raise ValueError("模型附件不完整")
+        manifest = json.loads(assets[prefix + "manifest.json"])
+        if (manifest.get("id") != identifier or set(manifest.get("files", {})) != {"return.txt", "risk.txt"}
+                or not isinstance(manifest.get("schema"), str) or not manifest["schema"]
+                or not isinstance(manifest.get("features"), list) or not manifest["features"]
+                or not all(isinstance(f, str) and f for f in manifest["features"])):
+            raise ValueError("模型清单格式无效")
+        if dt(manifest["generated_at"]) > now():
+            raise ValueError("模型清单时间无效")
+        for name, checksum in manifest["files"].items():
+            body = assets[prefix + name]
+            if not body or not isinstance(checksum, str) or digest(body) != checksum:
+                raise ValueError("模型内容校验失败")
+    for path, raw in assets.items():
+        if not research_asset(path):
+            raise ValueError("研究附件路径无效")
+        if path.startswith("training_runs/"):
+            value = json.loads(raw)
+            if value.get("state") not in {"complete", "insufficient", "failed"}:
+                raise ValueError("训练记录状态无效")
+            started, finished = dt(value["started_at"]), dt(value["finished_at"])
+            if finished < started or finished > now():
+                raise ValueError("训练记录时间无效")
+            if value["state"] == "complete" and not re.fullmatch(r"\d{4}-\d{2}-\d{2}-\d{6}-[a-f0-9]{8}", value.get("model_id", "")):
+                raise ValueError("训练记录缺少模型标识")
+        elif path.startswith("cloud_reviews/"):
+            value = json.loads(raw)
+            expected = f"cloud_reviews/{value.get('trade_date')}-{value.get('revision')}.json"
+            if value.get("schema_version") != 1 or path != expected or value.get("execution"):
+                raise ValueError("复盘附件格式或范围无效")
+
+
+def _verify_files(gh, files: dict[str, bytes], branch="data"):
+    """Read bytes and hash receipts from the same immutable Git commit."""
+    for path, expected in files.items():
+        body = gh.content(path, branch=branch)
+        receipt = json.loads(gh.content(path + ".manifest", branch=branch))
+        if body != expected or receipt.get("sha256") != digest(body) or receipt.get("bytes") != len(body):
+            raise ValueError("私有文件写后回读校验失败")
+
+
+def _data_parent(gh):
+    try:
+        parent = gh.api("git/ref/heads/data")["object"]["sha"]
+        base = gh.api(f"git/commits/{parent}")["tree"]["sha"]
+        tree = gh.api(f"git/trees/{base}?recursive=1")
+        if tree.get("truncated"):
+            raise ValueError("私有数据目录不完整")
+        return parent, base, {r["path"]: r["sha"] for r in tree.get("tree", [])}
+    except httpx.HTTPStatusError as exc:
+        # Only a missing branch is a valid empty repository. Other missing
+        # objects indicate a failed/inconsistent read and must not erase history.
+        if exc.response.status_code == 404 and exc.request.url.path.endswith("/git/ref/heads/data"):
+            return None, None, {}
+        raise
+
+
+def _publish_immutable(gh, files: dict[str, bytes], message: str):
+    if not files:
+        return {"state": "empty", "files": 0, "published": 0}
+    for attempt in range(3):
+        parent, base, existing = _data_parent(gh)
+        changed = []
+        published = 0
+        for path, raw in sorted(files.items()):
+            if not raw or len(raw) > 20 * 1024 * 1024:
+                raise ValueError("私有附件为空或超过大小限制")
+            if path in existing:
+                # Existing files are never trusted just because their names match.
+                _verify_files(gh, {path: raw}, branch=parent)
+                continue
+            if path + ".manifest" in existing:
+                raise ValueError("私有附件清单缺少对应内容")
+            manifest = json.dumps({"sha256": digest(raw), "bytes": len(raw)}, sort_keys=True).encode()
+            for name, body in ((path, raw), (path + ".manifest", manifest)):
+                blob = gh.api("git/blobs", "POST", {"content": base64.b64encode(body).decode(), "encoding": "base64"})
+                changed.append({"path": name, "mode": "100644", "type": "blob", "sha": blob["sha"]})
+            published += 1
+        if not changed:
+            _verify_files(gh, files, branch=parent)
+            return {"state": "verified", "files": len(files), "published": 0, "commit": parent}
+        body = {"tree": changed}
+        if base:
+            body["base_tree"] = base
+        tree = gh.api("git/trees", "POST", body)
+        commit = gh.api("git/commits", "POST", {"message": message, "tree": tree["sha"], "parents": [parent] if parent else []})
+        try:
+            if parent:
+                gh.api("git/refs/heads/data", "PATCH", {"sha": commit["sha"], "force": False})
+            else:
+                gh.api("git/refs", "POST", {"ref": "refs/heads/data", "sha": commit["sha"]})
+        except httpx.HTTPStatusError as exc:
+            if exc.response.status_code not in (409, 422) or attempt == 2:
+                raise
+            continue
+        except httpx.TransportError:
+            # A ref update may have executed despite a lost response. Check the
+            # actual branch once; never blindly repeat an uncertain mutation.
+            actual = gh.api("git/ref/heads/data")["object"]["sha"]
+            _verify_files(gh, files, branch=actual)
+            return {"state": "verified", "files": len(files), "published": published, "commit": actual, "recovered_uncertain_ref": True}
+        actual = gh.api("git/ref/heads/data")["object"]["sha"]
+        _verify_files(gh, files, branch=actual)
+        return {"state": "verified", "files": len(files), "published": published, "commit": actual}
+    raise ValueError("私有数据并发写入未完成")
+
+
 def publish_research_assets():
-    """Publish immutable research/model artifacts only. Never local accounts/controls."""
-    for path in (data_dir()/"reviews").glob("????-??-??.json"):
+    """Publish and read back immutable research files; never accounts/controls."""
+    for path in (data_dir() / "reviews").glob("????-??-??.json"):
         review = read_json(path)
         if review.get("execution"):
             continue
-        target = data_dir()/"cloud_reviews"/(review["trade_date"]+"-"+review["revision"]+".json")
+        target = data_dir() / "cloud_reviews" / (review["trade_date"] + "-" + review["revision"] + ".json")
         if not target.exists():
-            atomic_json(target,review)
+            atomic_json(target, review)
+    assets = {str(p.relative_to(data_dir())): p.read_bytes()
+              for folder in ("models", "training_runs", "cloud_reviews")
+              for p in (data_dir() / folder).rglob("*")
+              if p.is_file() and research_asset(str(p.relative_to(data_dir())))}
+    validate_research_payloads(assets)
+    if not assets:
+        return {"state": "empty", "files": 0, "published": 0}
     gh = GitHub()
-    assets = {str(p.relative_to(data_dir())):p for folder in ("models","training_runs","cloud_reviews")
-              for p in (data_dir()/folder).rglob("*") if p.is_file() and research_asset(str(p.relative_to(data_dir())))}
-    for attempt in range(3):
+    return _publish_immutable(gh, assets, "Verified private research artifacts")
+
+
+RUN_KEY = re.compile(r"(\d{4}-\d{2}-\d{2})-(initial|update|fallback|close|train)")
+
+
+def _run_receipt_path(key, value=None):
+    match = RUN_KEY.fullmatch(key)
+    if not match:
+        raise ValueError("迁移记录标识无效")
+    from datetime import date
+    date.fromisoformat(match[1])
+    if value is not None:
+        if (value.get("schema_version") != 1 or value.get("state") != "verified"
+                or value.get("day") != match[1] or value.get("mode") != match[2]
+                or any(k in value for k in ("logs", "raw_logs", "stdout", "stderr"))):
+            raise ValueError("迁移记录格式无效")
+    return f"migration_runs/{key}.json"
+
+
+def get_run_receipt(key: str):
+    path = _run_receipt_path(key)
+    gh = GitHub()
+    try:
         parent = gh.api("git/ref/heads/data")["object"]["sha"]
-        base = gh.api(f"git/commits/{parent}")["tree"]["sha"]
-        existing = {r["path"]:r["sha"] for r in gh.api(f"git/trees/{base}?recursive=1").get("tree",[])}
-        changed = []
-        for path,source in sorted(assets.items()):
-            raw = source.read_bytes()
-            git_sha = hashlib.sha1(b"blob "+str(len(raw)).encode()+b"\0"+raw).hexdigest()
-            if path in existing:
-                if existing[path] != git_sha:
-                    raise ValueError("拒绝覆盖研究版本 "+path)
-                continue
-            manifest = json.dumps({"sha256":digest(raw),"bytes":len(raw)}).encode()
-            for name,body in [(path,raw),(path+".manifest",manifest)]:
-                blob = gh.api("git/blobs","POST",{"content":base64.b64encode(body).decode(),"encoding":"base64"})
-                changed.append({"path":name,"mode":"100644","type":"blob","sha":blob["sha"]})
-        if not changed:
-            return {"published":0}
-        tree = gh.api("git/trees","POST",{"base_tree":base,"tree":changed})
-        commit = gh.api("git/commits","POST",{"message":"Daily reviews and validated research artifacts","tree":tree["sha"],"parents":[parent]})
-        try:
-            gh.api("git/refs/heads/data","PATCH",{"sha":commit["sha"],"force":False})
-            return {"published":len(changed)//2}
-        except httpx.HTTPStatusError as exc:
-            if exc.response.status_code not in (409,422) or attempt==2:
-                raise
+        raw = gh.content(path, branch=parent)
+    except httpx.HTTPStatusError as exc:
+        if exc.response.status_code == 404:
+            return None
+        raise
+    receipt = json.loads(gh.content(path + ".manifest", branch=parent))
+    if receipt.get("sha256") != digest(raw) or receipt.get("bytes") != len(raw):
+        raise ValueError("迁移记录校验失败")
+    value = json.loads(raw)
+    _run_receipt_path(key, value)
+    return value
+
+
+def publish_run_receipt(key: str, value: dict):
+    path = _run_receipt_path(key, value)
+    raw = json.dumps(value, ensure_ascii=False, sort_keys=True, allow_nan=False).encode()
+    return _publish_immutable(GitHub(), {path: raw}, "Verified private migration receipt")
 
 
 def sync_checkpoint(gh: GitHub) -> dict:
-    artifacts = gh.api("actions/artifacts?per_page=100").get("artifacts", [])
-    choices = sorted([a for a in artifacts if a["name"].startswith("checkpoint-") and not a.get("expired")], key=lambda a: a["created_at"], reverse=True)
+    from .private_checkpoints import CheckpointNotFound, restore_checkpoint
+    try:
+        return restore_checkpoint(gh, expected_date=None)
+    except CheckpointNotFound:
+        pass
     failures = []
-    for artifact in choices[:2]:
-        try:
-            return download_checkpoint(gh, artifact)
-        except Exception as exc:
-            failures.append({"artifact_id": artifact["id"], "error": str(exc)[:160]})
-    # A durable release is the bootstrap fallback, never an Actions cache.
-    bootstrap_checkpoint(gh)
-    current = {"state": "success", "source": "bootstrap_release", "synced_at": iso(), "artifact_errors": failures}
+    # Old Actions artifacts are an explicit compatibility option, not a
+    # permanent permission requirement for the new private Release storage.
+    if os.getenv("ASHARE_LEGACY_ARTIFACTS") == "1":
+        artifacts = gh.api("actions/artifacts?per_page=100").get("artifacts", [])
+        choices = sorted([a for a in artifacts if a["name"].startswith("checkpoint-") and not a.get("expired")], key=lambda a: a["created_at"], reverse=True)
+        for artifact in choices[:2]:
+            try:
+                result = download_checkpoint(gh, artifact)
+                result.update(source="legacy_artifact", degraded=True)
+                save_snapshot("checkpoint_status", result)
+                return result
+            except Exception:
+                failures.append({"artifact_id": artifact["id"], "error": "legacy_checkpoint_invalid"})
+    stats = bootstrap_checkpoint(gh)
+    current = {"state": "success", "source": "bootstrap_release", "degraded": True,
+               "readback_verified": False, "synced_at": iso(), "artifact_errors": failures, **stats}
     save_snapshot("checkpoint_status", current)
     return current
 
@@ -321,70 +495,28 @@ def download_checkpoint(gh: GitHub, artifact: dict) -> dict:
 
 
 def bootstrap_checkpoint(gh: GitHub):
-    """One-time private release seed; subsequent runs use Actions artifacts."""
+    """Legacy private release seed; new runs publish verified private Releases."""
     release = gh.api("releases/tags/data-bootstrap")
     asset = next(a for a in release["assets"] if a["name"] == "checkpoint.tar.gz")
-    if asset["size"] > 100 * 1024 * 1024:
-        raise ValueError("初始化包超过大小限制")
-    response = gh.client.get(f"/repos/{gh.repo}/releases/assets/{asset['id']}", headers={"Accept": "application/octet-stream"})
-    if response.status_code == 302:
-        location = response.headers["location"]
-        if not location.startswith("https://"):
-            raise ValueError("初始化包下载必须使用 HTTPS")
-        response = httpx.get(location, timeout=120)
-    response.raise_for_status()
-    if len(response.content) > 100 * 1024 * 1024:
-        raise ValueError("初始化包超过大小限制")
+    from .private_checkpoints import download_asset, inspect_checkpoint
+    raw = download_asset(gh, asset, max_bytes=100 * 1024 * 1024)
     path = data_dir() / "bootstrap.tar.gz"
     try:
-        path.write_bytes(response.content)
-        unpack_checkpoint(path, require_bars=True)
+        path.write_bytes(raw)
+        inspected = inspect_checkpoint(path)
+        restored = unpack_checkpoint(path, require_bars=True)
+        return {**inspected, **restored, "release_id": release.get("id"),
+                "asset_id": asset.get("id"), "tag": "data-bootstrap"}
     finally:
         path.unlink(missing_ok=True)
 
 
 def publish_report(report: dict):
-    """Optimistic Git ref update; retry on races, never force-push or overwrite versions."""
-    gh = GitHub()
+    """Validate, publish immutably and verify the bytes read from private storage."""
+    validate_report(report)
     raw = json.dumps(report, ensure_ascii=False, indent=2, allow_nan=False).encode()
     path = f"reports/{report['id']}.json"
-    manifest = json.dumps({"sha256": digest(raw), "bytes": len(raw), "generated_at": report["generated_at"]}).encode()
-    for attempt in range(3):
-        try:
-            ref = gh.api("git/ref/heads/data")
-            parent = ref["object"]["sha"]
-            base_tree = gh.api(f"git/commits/{parent}")["tree"]["sha"]
-        except httpx.HTTPStatusError as exc:
-            if exc.response.status_code != 404:
-                raise
-            parent, base_tree = None, None
-        if parent:
-            try:
-                old_raw = gh.content(path)
-                if json.loads(old_raw) != report:
-                    raise ValueError("拒绝覆盖已经发布的报告版本")
-                return
-            except httpx.HTTPStatusError as exc:
-                if exc.response.status_code != 404:
-                    raise
-        items = []
-        for name, body in [(path, raw), (path + ".manifest", manifest)]:
-            blob = gh.api("git/blobs", "POST", {"content": base64.b64encode(body).decode(), "encoding": "base64"})
-            items.append({"path": name, "mode": "100644", "type": "blob", "sha": blob["sha"]})
-        body = {"tree": items}
-        if base_tree:
-            body["base_tree"] = base_tree
-        tree = gh.api("git/trees", "POST", body)
-        commit = gh.api("git/commits", "POST", {"message": f"Research snapshot {report['id']}", "tree": tree["sha"], "parents": [parent] if parent else []})
-        try:
-            if parent:
-                gh.api("git/refs/heads/data", "PATCH", {"sha": commit["sha"], "force": False})
-            else:
-                gh.api("git/refs", "POST", {"ref": "refs/heads/data", "sha": commit["sha"]})
-            return
-        except httpx.HTTPStatusError as exc:
-            if exc.response.status_code not in (409, 422) or attempt == 2:
-                raise
+    return _publish_immutable(GitHub(), {path: raw}, "Verified private research snapshot")
 
 
 CHECKPOINT_FILES = {"calendar.json", "universe.json", "sectors.json", "metadata.json", "financials.json", "index_history.json", "index_histories.json", "announcements.json", "company_research.json", "history_checks.json"}

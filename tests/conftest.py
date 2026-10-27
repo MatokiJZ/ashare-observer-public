@@ -13,6 +13,11 @@ def isolated_data(tmp_path, monkeypatch):
     monkeypatch.delenv("GITHUB_TOKEN", raising=False)
     monkeypatch.delenv("ASHARE_STORAGE_TOKEN", raising=False)
     monkeypatch.delenv("ASHARE_STORAGE_REPO", raising=False)
+    monkeypatch.delenv("ASHARE_COMPUTE_REPO", raising=False)
+    monkeypatch.delenv("ASHARE_COMPUTE_WORKFLOW", raising=False)
+    monkeypatch.delenv("ASHARE_LEGACY_ARTIFACTS", raising=False)
+    monkeypatch.delenv("ASHARE_PRIVATE_WORKER", raising=False)
+    monkeypatch.delenv("ASHARE_PRIVATE_RECEIPT", raising=False)
     monkeypatch.setattr(Path, "home", lambda: tmp_path / "home")
 
 

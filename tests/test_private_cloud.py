@@ -141,31 +141,37 @@ def test_visibility_change_blocks_mutation(monkeypatch):
 
 @pytest.mark.parametrize("kind", ["report", "research_asset"])
 def test_public_compute_publishes_only_to_private_target_with_bot_metadata(monkeypatch, kind):
+    from test_cloud_readback import FakeGit
     actions(monkeypatch)
+    git = FakeGit()
     requests = []
 
     def handle(request):
         requests.append(request)
         assert request.url.path.startswith(f"/repos/{PRIVATE_REPO}")
-        path = request.url.path.removeprefix(f"/repos/{PRIVATE_REPO}")
-        if not path:
+        path = request.url.path.removeprefix(f"/repos/{PRIVATE_REPO}/")
+        if request.url.path == f"/repos/{PRIVATE_REPO}":
             return httpx.Response(200, json={"private": True, "full_name": PRIVATE_REPO})
-        if path == "/git/ref/heads/data":
-            if kind == "report":
-                return httpx.Response(404)
-            return httpx.Response(200, json={"object": {"sha": "synthetic-parent"}})
-        if path == "/git/commits/synthetic-parent":
-            return httpx.Response(200, json={"tree": {"sha": "synthetic-tree"}})
-        if path == "/git/trees/synthetic-tree":
-            return httpx.Response(200, json={"tree": []})
-        return httpx.Response(200, json={"sha": "synthetic-object"})
+        try:
+            if path.startswith("contents/"):
+                return httpx.Response(200, content=git.content(path[9:], request.url.params.get("ref", "data")))
+            if request.url.query:
+                path += "?" + request.url.query.decode()
+            return httpx.Response(200, json=git.api(path, request.method, json.loads(request.content) if request.content else None))
+        except httpx.HTTPStatusError as exc:
+            return httpx.Response(exc.response.status_code)
 
     client_transport(monkeypatch, handle)
     if kind == "report":
-        cloud.publish_report({"id": "2026-10-20-080000-update", "generated_at": "2026-10-20T08:00:00+08:00"})
+        value = {"id": "2026-10-20-080000-update", "generated_at": "2026-10-20T08:00:00+08:00",
+                 "trade_date": "2026-10-20", "schema_version": 1, "strategy_version": "synthetic", "candidates": []}
+        receipt = cloud.publish_report(value)
     else:
-        atomic_json(data_dir() / "training_runs/2026-10-20-080000.json", {"state": "synthetic"})
-        assert cloud.publish_research_assets() == {"published": 1}
+        atomic_json(data_dir() / "training_runs/2026-10-20-080000.json", {
+            "state": "insufficient", "started_at": "2026-10-20T08:00:00+08:00", "finished_at": "2026-10-20T08:01:00+08:00"})
+        receipt = cloud.publish_research_assets()
+    assert receipt["state"] == "verified" and receipt["published"] == 1
+    assert git.reads
     commits = [json.loads(r.content) for r in requests if r.method == "POST" and r.url.path.endswith("/git/commits")]
     assert len(commits) == 1
     for identity in (commits[0]["author"], commits[0]["committer"]):

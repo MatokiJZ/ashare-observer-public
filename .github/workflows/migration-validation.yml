@@ -24,6 +24,6 @@ jobs:
           python -m pip install -r requirements.lock
           python -m pip install --no-deps -e .
       - name: Check synthetic storage and failure boundaries
-        run: python -m pytest -q tests/test_private_cloud.py tests/test_cloud_task_migration.py
+        run: python -m pytest -q tests/test_private_cloud.py tests/test_cloud_task_migration.py tests/test_private_checkpoints.py tests/test_cloud_readback.py tests/test_private_runner.py tests/test_private_cloud_entry.py
       - name: State validation scope
         run: echo 'Synthetic validation only. Live inputs, private persistence, daily research and weekly training are not verified.'
